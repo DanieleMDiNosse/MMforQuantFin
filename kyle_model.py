@@ -1,3 +1,5 @@
+'''This code is inspired by the code written by Dale Rosenthal's that can be found at
+https://sites.google.com/site/dalerosenthal/teaching/market-microstructure'''
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
@@ -5,6 +7,9 @@ import math
 import cmath
 import logging
 import argparse
+import imageio
+from tqdm import tqdm
+import os
 
 def cardano(a, b, c, d):
     '''Compute the roots of a cubic equation using the Cardano's formula. For details see
@@ -20,12 +25,11 @@ def cardano(a, b, c, d):
     roots = [root_1, root_2, root_3]
     return sorted(roots, key=lambda x: x.real)
 
-def kyle_sim(Sigma_N, n_steps):
+def kyle_sim(Sigma_N, sgm_u, Sgm_0, n_steps):
     '''This function evaluates the parameters of the kyle multiperiod model at each time step
-    (at each auction). The idea is to reason backwards, starting from a guess of the final 
+    (at each auction) and the loss function. The idea is to reason backwards, starting from a guess of the final 
     value of Sgm_N (the variance of the transaction price ad time t=T) and then compute the
-    corresponding value of Sgm_0*. If |Sgm_0 - Sgm_0*| < eps, then we are satisfied about the guess.
-    Otherwise, we guess another time and repeat the procedure.'''
+    corresponding value of Sgm_0*. At the end the loss  |Sgm_0 - Sgm_0*| is computed.'''
 
     delta_t = 1/n_steps # could also be a vector if trades are irregularly spaced
     Sigma = np.zeros(n_steps+1)
@@ -74,12 +78,16 @@ def kyle_sim(Sigma_N, n_steps):
             'lambda': lambda_, 
             'beta': beta}
 
-def loss(Sigma_N, n_steps):
-    res = kyle_sim(Sigma_N, n_steps)
+def loss(Sigma_N, sgm_u, Sgm_0, n_steps):
+    '''Wrapper function to be used by the scipy.optimize.minimize function. It returns the loss function
+    of the kyle multiperiod model.'''
+    res = kyle_sim(Sigma_N, sgm_u, Sgm_0, n_steps)
     diff = res['sqdiff']
     return diff
 
 def volume(beta, lambda_, v, n_steps):
+    '''This function simulates the volume of the market maker and
+     of the informed trader at each time step (at each auction)'''
     p = np.zeros(shape=n_steps)
     p[0] = 2
     delta_x = np.zeros(shape=n_steps)
@@ -122,14 +130,15 @@ if __name__=='__main__':
     v = np.random.normal(p0, Sgm_0)
 
     Sgm_N_guess = np.random.uniform(0,1)
-    opt = minimize(loss, Sgm_N_guess, args=n_steps, method='BFGS')
+    opt = minimize(loss, Sgm_N_guess, args=(sgm_u, Sgm_0, n_steps), method='BFGS')
     print(opt)
 
-    res = kyle_sim(opt.x, n_steps)
+    res = kyle_sim(opt.x, sgm_u, Sgm_0, n_steps)
     volumes = volume(res['beta'], res['lambda'], v, n_steps)
 
     fig, axs = plt.subplots(4,1, tight_layout=True, figsize=(7,8))
     auctions = np.arange(n_steps+1)
+    axs[0].set_title(fr'$\sigma_u$ = {sgm_u:.2f} ; $\Sigma_0$ = {Sgm_0:.2f} ; $\Sigma_N$ = {opt.x[0]:.2f}')
     axs[0].scatter(auctions, res['Sigma'], s=15, c='black', alpha=0.8)
     axs[0].set_ylabel(r'$\Sigma_n$')
     axs[1].scatter(auctions, res['lambda'], s=15, c='black', alpha=0.8)
@@ -137,10 +146,46 @@ if __name__=='__main__':
     axs[2].scatter(np.arange(n_steps), volumes['delta_x'], label='Informed', s=15, c='black', alpha=0.8)
     axs[2].scatter(np.arange(n_steps), volumes['delta_u'], label='Uninformed', s=15, c='green', alpha=0.8)
     axs[2].set_ylabel(r'$\Delta x$ and $\Delta_u$')
-    axs[2].legend(loc='upper left')
+    axs[2].legend(loc='upper left', bbox_to_anchor=(1, 1), fancybox=True)
     axs[3].plot(volumes['p'], 'k', alpha=0.8)
     axs[3].set_ylabel('p')
     axs[3].set_xlabel('Auctions n')
     axs[3].hlines(v, 0, volumes['p'].shape[0], linestyles='dashed')
     axs[3].text(10, v, f"True Price = {v:.2f}")
     plt.show()
+
+    # Generate a gif of all the subplots above varying the value of sgm_u in the range [0,1]
+    
+    auctions = np.arange(n_steps+1)
+    images = []
+    for sgm_u in tqdm(np.linspace(0.5,3,100)):
+        fig, axs = plt.subplots(4,1, tight_layout=True, figsize=(9,8))
+        res = kyle_sim(opt.x, sgm_u, Sgm_0, n_steps)
+        volumes = volume(res['beta'], res['lambda'], v, n_steps)
+        axs[0].set_title(fr'$\sigma_u$ = {sgm_u:.2f}')
+        axs[0].scatter(auctions, res['Sigma'], s=15, c='black', alpha=0.8)
+        axs[0].set_ylabel(r'$\Sigma_n$')
+        axs[1].scatter(auctions, res['lambda'], s=15, c='black', alpha=0.8)
+        axs[1].set_ylabel(r'$\lambda$')
+        axs[2].scatter(np.arange(n_steps), volumes['delta_x'], label='Informed', s=15, c='black', alpha=0.8)
+        axs[2].scatter(np.arange(n_steps), volumes['delta_u'], label='Uninformed', s=15, c='green', alpha=0.8)
+        axs[2].set_ylabel(r'$\Delta x$ and $\Delta_u$')
+        axs[2].legend(loc='upper left', bbox_to_anchor=(1, 1), fancybox=True)
+        axs[3].plot(volumes['p'], 'k', alpha=0.8)
+        axs[3].set_ylabel('p')
+        axs[3].set_xlabel('Auctions n')
+        axs[3].hlines(v, 0, volumes['p'].shape[0], linestyles='dashed')
+        axs[3].text(10, v, f"True Price = {v:.2f}")
+        filename = "plot_{:.2f}.png".format(Sgm_N_guess)
+        plt.savefig(filename)
+        # Add the image to the list
+        images.append(imageio.imread(filename))
+        # Clear the plot for the next iteration
+        plt.clf()
+        os.system(f'rm plot_{Sgm_N_guess:.2f}.png')
+        plt.close()
+
+
+    # Save the list of images as a GIF file
+    imageio.mimsave('kyle.gif', images, fps=5)
+
