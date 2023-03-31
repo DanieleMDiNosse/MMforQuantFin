@@ -16,8 +16,8 @@ def cardano(a, b, c, d):
     https://tinyurl.com/2fmtpw4t '''
     p = b**2 / (3 * a**2) - c / a
     q = 2 * b**3 / (27 * a**3) - b * c / (3 * a**2) + d / a
-    Q = cmath.sqrt(p / 3)
-    R = cmath.sqrt(q / 2)
+    Q = complex(p / 3, 0)
+    R = complex(q / 2, 0)
     theta = cmath.acos(R / cmath.sqrt(Q**3))
     root_1 = -2 * cmath.sqrt(Q) * cmath.cos(theta / 3) - b / (3 * a)
     root_2 = -2 * cmath.sqrt(Q) * cmath.cos((theta + 2 * cmath.pi) / 3) - b / (3 * a)
@@ -37,9 +37,9 @@ def kyle_sim(Sigma_N, sgm_u, Sgm_0, n_steps):
     delta = np.zeros(n_steps+1)
     lambda_ = np.zeros(n_steps+1)
     beta = np.zeros(n_steps+1)
-    Sigma[n_steps] = Sigma_N
-    alpha[n_steps] = 0
-    delta[n_steps] = 0
+    Sigma[-1] = Sigma_N
+    alpha[-1] = 0
+    delta[-1] = 0
 
     if Sigma_N <= 0:
         diff = 99e99
@@ -50,23 +50,22 @@ def kyle_sim(Sigma_N, sgm_u, Sgm_0, n_steps):
             'lambda': lambda_, 
             'beta': beta}
     
-    lambda_[n_steps] = math.sqrt(Sigma[n_steps])/(sgm_u*math.sqrt(2*delta_t))
+    lambda_[-1] = math.sqrt(Sigma[-1])/(sgm_u*math.sqrt(2*delta_t))
     
-    for i in range(n_steps, 0, -1):
-
+    for i in range(n_steps-1, -1, -1):
         # Evaluate in backward fashion the parameters
-        beta[i-1] = (1-2*alpha[i]*lambda_[i])/(2*lambda_[i]*(1-alpha[i]*lambda_[i])*delta_t)
-        Sigma[i-1] = Sigma[i]/(1-beta[i-1]*lambda_[i]*delta_t)
-        alpha[i-1] = 1/(4*lambda_[i]*(1-alpha[i]*lambda_[i]))
-        delta[i-1] = delta[i] + alpha[i]*lambda_[i]**2*sgm_u**2*delta_t
+        beta[i+1] = (1-2*alpha[i+1]*lambda_[i+1])/(2*lambda_[i+1]*(1-alpha[i+1]*lambda_[i+1])*delta_t)
+        Sigma[i] = Sigma[i+1]/(1-beta[i+1]*lambda_[i+1]*delta_t)
+        alpha[i] = 1/(4*lambda_[i+1]*(1-alpha[i+1]*lambda_[i+1]))
+        delta[i] = delta[i+1] + alpha[i+1]*lambda_[i+1]**2*sgm_u**2*delta_t
 
         # Setting values for the root finding procedure
-        a = alpha[i-1]*sgm_u**2*delta_t/Sigma[i-1]
-        b = -sgm_u**2*delta_t/Sigma[i-1]
-        c = -alpha[i-1]
+        a = alpha[i]*sgm_u**2*delta_t/Sigma[i]
+        b = -sgm_u**2*delta_t/Sigma[i]
+        c = -alpha[i]
         d = 1/2
         # solve lambda cubic -- which has three real roots.
-        lambda_[i-1] = cardano(a, b, c, d)[1].real  # pick the middle root
+        lambda_[i] = cardano(a, b, c, d)[1].real  # pick the middle root
     
     beta[0] = (1-2*alpha[0]*lambda_[0])/(2*lambda_[0]*(1-alpha[0]*lambda_[0])*delta_t)
 
@@ -107,10 +106,10 @@ if __name__=='__main__':
         description='Kyle multiperiod model for market microstructure')
     parser.add_argument("-l", "--log", default="info",
                         help=("Provide logging level. Example --log debug', default='info"))
-    parser.add_argument("-n", "--n_steps", type=int, help='Number of steps', default=100)
-    parser.add_argument("-su", "--sgm_u", type=int, help='Standard deviation of the volumes of noise traders (constant for each auction)', default=0.9)
-    parser.add_argument("-s0", "--Sgm_0", type=int, help='Variance of the initial price (what the MM conjectures) At each auction this quantity will reduce -> the MM learns', default=0.16)
-    parser.add_argument("-p0", "--p0", type=int, help='Initial price', default=2)
+    parser.add_argument("-n", "--n_steps", type=int, help='Number of steps. Default 100', default=100)
+    parser.add_argument("-su", "--sgm_u", type=int, help='Standard deviation of the volumes of noise traders (constant for each auction). Default 0.9', default=0.9)
+    parser.add_argument("-s0", "--Sgm_0", type=int, help='Variance of the initial price (what the MM conjectures) At each auction this quantity will reduce -> the MM learns. Default 0.16', default=0.16)
+    parser.add_argument("-p0", "--p0", type=int, help='Initial price. Default 2', default=2)
     args = parser.parse_args()
     levels = {'critical': logging.CRITICAL,
               'error': logging.ERROR,
@@ -130,7 +129,7 @@ if __name__=='__main__':
     v = np.random.normal(p0, Sgm_0)
 
     Sgm_N_guess = np.random.uniform(0,1)
-    opt = minimize(loss, Sgm_N_guess, args=(sgm_u, Sgm_0, n_steps), method='BFGS')
+    opt = minimize(loss, Sgm_N_guess, args=(sgm_u, Sgm_0, n_steps), method='BFGS') # what is the error made?
     print(opt)
 
     res = kyle_sim(opt.x, sgm_u, Sgm_0, n_steps)
@@ -154,6 +153,7 @@ if __name__=='__main__':
     axs[3].text(10, v, f"True Price = {v:.2f}")
     plt.show()
 
+    print(res['Sigma'])
     # Generate a gif of all the subplots above varying the value of sgm_u in the range [0,1]
     
     auctions = np.arange(n_steps+1)
@@ -184,7 +184,6 @@ if __name__=='__main__':
         plt.clf()
         os.system(f'rm plot_{Sgm_N_guess:.2f}.png')
         plt.close()
-
 
     # Save the list of images as a GIF file
     imageio.mimsave('kyle.gif', images, fps=5)
