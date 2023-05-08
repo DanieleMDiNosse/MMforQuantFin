@@ -6,7 +6,7 @@ plt.style.use('seaborn')
 
 # Parameters
 T = 20000
-c = 0.01
+c = 0.01 # c is half the spread
 m0 = 50 # first value of the efficient price
 su = 0.01 # standard deviation of the efficient price
 
@@ -15,9 +15,12 @@ m[0] = m0
 p = np.empty(shape=T)
 
 # Model simulation
-q = 2 * np.random.binomial(n=1,p=0.5,size=T) - 1 # generation of the arrivals of trades
+# generation of the arrivals of trades: +1 for buy, -1 for sell
+q = 2 * np.random.binomial(n=1,p=0.5,size=T) - 1
 for i in range(T-1):
+    # m is the efficient price
     m[i+1] = m[i] + np.random.normal(0,su)
+# p is the transaction price
 p = m + q * c
 plt.figure()
 plt.plot(p, label='Transaction price')
