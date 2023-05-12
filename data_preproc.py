@@ -1,5 +1,6 @@
 import numpy as np
-import pandas as pd
+# import pandas as pd
+import polar
 import matplotlib.pyplot as plt
 import imageio
 import os
@@ -9,6 +10,9 @@ import logging
 from scipy.optimize import minimize_scalar
 from numba import jit
 import time
+import warnings
+from datetime import datetime, timedelta
+import polars as pd
 
 # ORGANIZATION OF THE DATA (FOR EACH TRADING DAY)
 # Message file's columns are as follows:
@@ -17,7 +21,7 @@ import time
 # 1: Submission of a new limit order
 # 2: Cancellation (partial deletion) of a limit order
 # 3: Deletion (total) of a limit order
-# 4: Execution of a visible limit order
+# 4: Execution of a visible limit orderread_csvread_csv
 # 5: Execution of a hidden limit order
 # 6: Cross
 # 7: Trading halt indicator
@@ -32,11 +36,28 @@ import time
 # For TSLA the tick size in 2015 was 0.01 USD (100 in the data)
 
 def data_preproc(paths_lob, paths_msg, N_days):
-    orderbook = pd.concat([pd.read_csv(f'{paths_lob[i]}') for i in range(N_days)])
-    message = pd.concat([pd.read_csv(f'{paths_msg[i]}') for i in range(N_days)])
-    print(orderbook)
-    print(message)
-    logging.info(f'Number of trading days considered: {N_days}\nTotal events: {orderbook.shape[0]}')
+
+    if (N_days > len(paths_lob)) or (N_days > len(paths_msg)):
+        warnings.warn(f'\nNumber of days considered is greater than the number of days available. Number of days considered: {N_days}. Number of days available: {len(paths_lob)}. N_days is set to {len(paths_lob)}.')
+        N_days = len(paths_lob)
+
+    # create the list of dates
+    dates = [paths_lob[i].split('/')[-1].split('_')[1] for i in range(N_days)]
+    datetimes = []
+    for day in dates:
+        year, month, day = int(day.split('-')[0]), int(day.split('-')[1].split('0')[1]), int(day.split('-')[2])
+        datetimes.append(datetime(year, month, day))
+
+    orderbook = [pd.read_pickle(f'{paths_lob[i]}') for i in range(N_days)]
+    message = [pd.read_pickle(f'{paths_msg[i]}') for i in range(N_days)]
+
+    for i in range(N_days):
+        message[i][message[i].columns[0]] = message[i][message[i].columns[0]].apply(lambda x: datetimes[i] + timedelta(seconds=x))
+        orderbook[i].columns = [f'dummy_column_{i}' for i in range(orderbook[i].shape[1])]
+        message[i].columns = [f'dummy_column_{i}' for i in range(message[i].shape[1])]
+    message = pd.concat(message, ignore_index=True)
+    orderbook = pd.concat(orderbook, ignore_index=True)
+    logging.info(f'--------------------\nNumber of trading days considered: {N_days}\nTotal events: {orderbook.shape[0]}\n------------------------------')
     # Drop the last column of the message dataframe if there are > 6 columns
     if message.shape[1] > 6: message = message.drop(columns=message.columns[-1])
 
@@ -93,6 +114,11 @@ def dq_dist(executions, tick_size):
             #     raise ValueError('There are both buy and sell market orders at the same time')
         
             min = exec[exec['Time'] == df['Time'][i]]['Price'].min()
+            # print(exec[exec['Time'] == df['Time'][i]])
+            # print(exec[exec['Time'] == df['Time'][i]]['Price'].min())
+            # exit()
+            
+            # PROBLEMA COL TICK!!! E' 100 O 50?! 50 APPARE SOLO PER EVENT TYPE 5
             max = exec[exec['Time'] == df['Time'][i]]['Price'].max()
             # print(exec[exec['Time'] == df['Time'][i]][['Price', 'Direction']])
             # time.sleep(1)
@@ -100,10 +126,12 @@ def dq_dist(executions, tick_size):
                 tick_shift = int((min - max) / tick_size)
             else:
                 tick_shift = int((max - min) / tick_size)
+            if (np.abs(tick_shift) == 2.5) or (np.abs(tick_shift) == 6.5):
+                print(min, max)
 
             dq.append(tick_shift)
     
-    return dq
+    return np.array(dq)
 
 def lob_reconstruction(N, tick, m, M, bid_prices, bid_volumes, ask_prices, ask_volumes):
     n_columns = bid_prices.shape[1]
@@ -163,7 +191,7 @@ def mid_price(bid_prices, ask_prices):
 def sq_dist_objective(f, midprice, target_var=2):
     midprice = midprice / 10000
     var = midprice[::int(f)].diff().var()
-    print(var)
+    # print(var)
     sq_dist = (var - target_var)**2
     return sq_dist
 
@@ -178,7 +206,11 @@ def avg_imbalance(bid_volumes, ask_volumes, weight, f):
         imb.append(num/det)
     return np.array(imb)
     
-
+def direction_of_hlo(message):
+    hlo = message[message['Event type'] == 5]
+    hlo = hlo['Direction'].unique()
+    print(hlo)
+    return hlo
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -189,6 +221,7 @@ if __name__ == '__main__':
     parser.add_argument("-MSFT", "--MSFT", action='store_true')
     parser.add_argument("-N", "--N_days", type=int, help='Number of trading days', default=100)
     parser.add_argument("-ip", "--imbalance_plot", action='store_true', help='Plot the imbalance distribution')
+    parser.add_argument("-pp", "--pre_proc", action='store_true', help='Perform data preprocessing')
     args = parser.parse_args()
     levels = {'critical': logging.CRITICAL,
               'error': logging.ERROR,
@@ -198,9 +231,11 @@ if __name__ == '__main__':
     logging.basicConfig(level=levels[args.log])
     # plt.style.use('ggplot')
 
+    tick = 100
     paths_lob = []
     paths_msg = []
     if args.TSLA:
+        info = ['TSLA', '2015-01-01']
         folder_path = 'data/TSLA_2015-01-01_2015-01-31_10'
         filenames = os.listdir(folder_path)
         for file in filenames:
@@ -209,6 +244,7 @@ if __name__ == '__main__':
             elif 'message' in file:
                 paths_msg.append(f'/home/danielemdn/Documents/MMforQuantFin/{folder_path}/{file}')
     elif args.MSFT:
+        info = ['MSFT', '2018-04-01']
         folder_path = 'data/MSFT_2018-04-01_2018-04-30_5'
         filenames = os.listdir(folder_path)
         for file in filenames:
@@ -220,17 +256,24 @@ if __name__ == '__main__':
     paths_lob.sort()
     paths_msg.sort()
 
-    dq = np.zeros(1)
-    orderbook, message, m, M, bid_prices, bid_volumes, ask_prices, ask_volumes = data_preproc(paths_lob, paths_msg, args.N_days)
+    if args.pre_proc:
+        logging.info('Performing data preprocessing')
+        orderbook, message, m, M, bid_prices, bid_volumes, ask_prices, ask_volumes = data_preproc(paths_lob, paths_msg, args.N_days)
+        orderbook.to_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
+        message.to_pickle(f'{info[0]}_message_{info[1]}.pkl')
+    orderbook = pd.read_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
+    message = pd.read_pickle(f'{info[0]}_message_{info[1]}.pkl')
+    hlo = direction_of_hlo(message)
     executions = executions_finder(message)
-    midprice = mid_price(bid_prices, ask_prices)
-    res = minimize_scalar(sq_dist_objective, args=(midprice,), bounds=(1, 1000), method='bounded')
-    print(res)
-    exit()
-    DQ = np.array(dq_dist(executions, 100))
-    dq = np.hstack((dq, DQ))
+    # midprice = mid_price(bid_prices, ask_prices)
+    # res = minimize_scalar(sq_dist_objective, args=(midprice,), bounds=(1, 1000), method='bounded')
+    # dq = np.zeros(1)
+    # DQ = np.array(dq_dist(executions, 100))
+    # dq = np.hstack((dq, DQ))
+    dq = dq_dist(executions, 100)
     np.save('dq.npy', dq)
     value, count = np.unique(dq, return_counts=True)
+    print(value, count)
     x = np.arange(value.min(), value.max()+1)
     mask = np.in1d(x, value)
     y = np.zeros_like(x)
@@ -255,7 +298,7 @@ if __name__ == '__main__':
 
 # Personal notes
 #WHICH PRICE IS THE BEST TO USE? MID PRICE OR THE PRICE OF THE FIRST LEVEL?
-# Fix the concatanation of the dataframes in data_preproc
+# Fix the concatanation of the dataframes in data_preproc1 -> Done
 # Compute the best frequency of sampling with a target price variance of 2.
 
 
