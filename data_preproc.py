@@ -6,9 +6,9 @@ import os
 from tqdm import tqdm
 import argparse
 import logging
-from scipy.optimize import minimize_scalar
 from scipy.optimize import minimize
-from numba import jit
+from scipy.optimize import LinearConstraint, NonlinearConstraint
+import numba as nb
 import time
 import warnings
 from datetime import datetime, timedelta
@@ -37,9 +37,34 @@ import statsmodels.api as sm
 # For TSLA the tick size in 2015 was 0.01 USD (100 in the data)
 
 def data_preproc(paths_lob, paths_msg, N_days):
+    '''This function takes as input the paths of the orderbook and message files for a period of N_days and returns
+    the orderbook and message dataframes stacked and with the appropriate columns names, the minimum and maximum 
+    values of the prices and the number of trading days considered (via logging).
+    
+    Parameters
+    ----------
+    paths_lob : list
+        List of paths of the orderbook files.
+    paths_msg : list
+        List of paths of the message files.
+    N_days : int
+        Number of trading days to consider.
+    
+    Returns
+    -------
+    orderbook : pandas dataframe
+        Dataframe containing the orderbook data.
+    message : pandas dataframe
+        Dataframe containing the message data.
+    m : float
+        Minimum value of the prices.
+    M : float
+        Maximum value of the prices.'''
 
     if (N_days > len(paths_lob)) or (N_days > len(paths_msg)):
-        warnings.warn(f'\nNumber of days considered is greater than the number of days available. Number of days considered: {N_days}. Number of days available: {len(paths_lob)}. N_days is set to {len(paths_lob)}.')
+        warnings.warn(f'\nNumber of days considered is greater than the number of days available. \
+                       Number of days considered: {N_days}. Number of days available: {len(paths_lob)}.\
+                       N_days is set to {len(paths_lob)}.')
         N_days = len(paths_lob)
 
     # create the list of dates
@@ -56,9 +81,11 @@ def data_preproc(paths_lob, paths_msg, N_days):
         message[i][message[i].columns[0]] = message[i][message[i].columns[0]].apply(lambda x: datetimes[i] + timedelta(seconds=x))
         orderbook[i].columns = [f'dummy_column_{i}' for i in range(orderbook[i].shape[1])]
         message[i].columns = [f'dummy_column_{i}' for i in range(message[i].shape[1])]
+
     message = pd.concat(message, ignore_index=True)
     orderbook = pd.concat(orderbook, ignore_index=True)
-    logging.info(f'--------------------\nNumber of trading days considered: {N_days}\nTotal events: {orderbook.shape[0]}\n------------------------------')
+    logging.info(f'--------------------\nNumber of trading days considered: \
+                  {N_days}\nTotal events: {orderbook.shape[0]}\n------------------------------')
     # Drop the last column of the message dataframe if there are > 6 columns
     if message.shape[1] > 6: message = message.drop(columns=message.columns[-1])
 
@@ -79,6 +106,19 @@ def data_preproc(paths_lob, paths_msg, N_days):
     return orderbook, message, m, M
 
 def executions_finder(message):
+    '''This function takes as input the message dataframe and returns the executions dataframe. The executions
+    dataframe contains all the rows of the message dataframe that correspond to a market order.
+    
+    Parameters
+    ----------
+    message : pandas dataframe
+        Dataframe containing the message data.
+    
+    Returns
+    -------
+    executions : pandas dataframe
+        Dataframe containing the executions data.'''
+
     # Select the market orders
     visible_lo = message[message['Event type'] == 4]
     # hidden_lo = message[message['Event type'] == 5]
@@ -92,6 +132,26 @@ def executions_finder(message):
 # 3. Compute (max-min)/tick_size
 
 def dq_dist(executions, tick_size, depth):
+    '''This function takes as input the executions dataframe, the tick size and the depth and returns the
+    distribution of dq. The distribution of dq is a list of integers that represent the number of ticks
+    that the price has moved following a market order. LOBSTER message files is organized in such a way that
+    all the rows that share the same timestamp correspond the same market order. Therefore, the function
+    computes the minimum and maximum price for each timestamp and then computes the number of ticks that
+    the price has moved. If the number of ticks is greater than the depth, the timestamp is discarded.
+
+    Parameters
+    ----------
+    executions : pandas dataframe
+        Dataframe containing the executions data.
+    tick_size : float
+        Tick size.
+    depth : int
+        Depth of the LOB.
+    
+    Returns
+    -------
+    dq : numpy array
+        Array containing the distribution of dq.'''
 
     dq = []
     t = executions['Time'].value_counts().index
@@ -116,6 +176,33 @@ def dq_dist(executions, tick_size, depth):
     return np.array(dq)
 
 def lob_reconstruction(N, tick, m, M, bid_prices, bid_volumes, ask_prices, ask_volumes):
+    '''This function takes as input the number of events, the tick size, the minimum and maximum values of the prices,
+    the bid and ask prices and volumes and returns the limit order book snapshots for each event.
+
+    Parameters
+    ----------
+    N : int
+        Number of events.
+    tick : float
+        Tick size.
+    m : float
+        Minimum value of the prices.
+    M : float
+        Maximum value of the prices.
+    bid_prices : pandas dataframe
+        Dataframe containing the bid prices.
+    bid_volumes : pandas dataframe
+        Dataframe containing the bid volumes.
+    ask_prices : pandas dataframe
+        Dataframe containing the ask prices.
+    ask_volumes : pandas dataframe
+        Dataframe containing the ask volumes.
+    
+    Returns
+    -------
+    lob_snapshots : list
+        List of the limit order book snapshots for each event.'''
+
     n_columns = bid_prices.shape[1]
     lob_snapshots = []
     for event in tqdm(range(N)):
@@ -177,18 +264,76 @@ def sq_dist_objective(f, orderbook, tick, target_var=2):
     sq_dist = (ask_price_diff.var() - target_var)**2
     return sq_dist
 
+@nb.njit
+def dot_product(a, b):
+    '''This function takes as input two numpy arrays and returns their dot product.
+    
+    Parameters
+    ----------
+    a : numpy array
+        First array.
+    b : numpy array
+        Second array.
+    
+    Returns
+    -------
+    result : float
+        Dot product of the two arrays.'''
 
+    result = 0.0
+    for i in range(len(a)):
+        result += a[i] * b[i]
+    return result
+
+@nb.njit
 def avg_imbalance(num_events, bid_volumes, ask_volumes, weight, f):
+    '''This function takes as input the number of events, the bid and ask volumes, the weight and the frequency
+    and returns the average imbalance.
+
+    Parameters
+    ----------
+    num_events : int
+        Number of events.
+    bid_volumes : numpy array
+        Array containing the bid volumes.
+    ask_volumes : numpy array
+        Array containing the ask volumes.
+    weight : numpy array
+        Array containing the weight.
+    f : int
+        Frequency.
+    
+    Returns
+    -------
+    imb : numpy array
+        Array containing the average imbalance.'''
+
     lev = weight.shape[0]
     imb = []
-    for i in tqdm(range(0, num_events, f), desc='Computing average imbalance'):
-        num = np.dot(np.array(bid_volumes.iloc[i:i+f, :lev]), weight).sum()
-        det = np.dot((np.array(bid_volumes.iloc[i:i+f, :lev]) + \
-                      np.array(ask_volumes.iloc[i:i+f, :lev])), weight).sum()
+    for i in range(0, num_events, f):
+        num = dot_product(bid_volumes[i:i+f, :lev][0], weight)
+        det = dot_product((bid_volumes[i:i+f, :lev][0] + ask_volumes[i:i+f, :lev][0]), weight)
         imb.append(num/det)
     return np.array(imb)
 
 def joint_imbalance(message, imbalance):
+    '''This function takes as input the message dataframe and the imbalance and returns the imbalance
+    just before and after a market order. The empirical joint imbalance is then the scatter plot of the two arrays.
+
+    Parameters
+    ----------
+    message : pandas dataframe
+        Dataframe containing the message data.
+    imbalance : numpy array
+        Array containing the imbalance.
+    
+    Returns
+    -------
+    i_m : numpy array
+        Array containing the imbalance just before a market order.
+    i_p : numpy array
+        Array containing the imbalance just after a market order.
+    '''
     message = message.iloc[:imbalance.shape[0]]
     executions = executions_finder(message)
     t = executions['Time'].value_counts().index
@@ -210,6 +355,66 @@ def joint_imbalance(message, imbalance):
     plt.show()
 
     return np.array(i_m), np.array(i_p)
+
+def i_spoofing(i_m, dq, dp_p, weight, k, depth, bid_volumes, ask_volumes, message):
+    '''This function takes as input the imbalance just before a market order, the distribution of dq, the distribution
+    of dp, the weight, the level k where the spoofing is performed, the depth, the bid and ask volumes and the message
+    dataframe and returns the imbalance of spoofing.
+
+    Parameters
+    ----------
+    i_m : numpy array
+        Array containing the imbalance just before a market order.
+    dq : numpy array
+        Array containing the distribution of dq.
+    dp_p : numpy array
+        Array containing the distribution of dp.
+    weight : numpy array
+        Array containing the weight.
+    k : int
+        Level where the spoofing is performed.
+    depth : int
+        Depth of the LOB.
+    bid_volumes : pandas dataframe
+        Dataframe containing the bid volumes.
+    ask_volumes : pandas dataframe
+        Dataframe containing the ask volumes.
+    message : pandas dataframe
+        Dataframe containing the message data.
+    
+    Returns
+    -------
+    i_spoof : numpy array
+        Array containing the imbalance of spoofing.'''
+
+    # Mean of ask_volumes and bid_volumes up to level 4 for each timestamp.
+    executions = executions_finder(message)
+    H = np.zeros(message.shape[0])
+    t = executions['Time'].value_counts().index
+    c = executions['Time'].value_counts().values
+    d = {'Time': t, 'Count': c}
+    df = pd.DataFrame(data=d)
+    for i in tqdm(range(df.shape[0]), desc='Computing H'):
+        volumes = executions[executions['Time'] == df['Time'][i]]
+        volumes = volumes[volumes['Direction'] == -1]['Size']
+        for j, i in zip(volumes.index, range(volumes.shape[0])):
+            H[j] = volumes.sum() - volumes.iloc[:i].sum()
+    a = ask_volumes.iloc[:, :4].mean(axis=1)
+    b = bid_volumes.iloc[:, :4].mean(axis=1)
+    rho = H / a
+    # Fix a value of the level k where I want to spoof and then evaluate
+    # mu+, Q_k, v_k
+    mu_p = dp_p.mean()
+    i_spoof = np.zeros([i_m, depth])
+    # for t in range(i_m.shape[0]):
+    #     for k in range(depth):
+    #         Q_k = dq[k + 1:].sum()
+    #         v_k = np.array([(i-k) * dq[k + 1:] for i in range(k + 1, depth)]).sum()
+    #         if 2 * rho[t] * weight[k] * mu_p * (1 - i_m[t]) / i_m[t]
+
+
+
+
     
     
 def direction_of_hlo(message):
@@ -219,22 +424,58 @@ def direction_of_hlo(message):
     return hlo
 
 def dp_dist(parameters, M, num_events, bid_volumes, ask_volumes, f):
-    dp = parameters[:M + 1]
-    w = parameters[M + 1:]
+    '''This function takes as input the parameters, the number of levels, the number of events, the bid and ask volumes,
+    the frequency and returns the (negative) objective function that has to be minimize to estimate the values of
+    dp^+ and w (ML estimation).
+    
+    Parameters
+    ----------
+    parameters : numpy array
+        Array containing the parameters.
+    M : int
+        Number of levels.
+    num_events : int
+        Number of events.
+    bid_volumes : pandas dataframe
+        Dataframe containing the bid volumes.
+    ask_volumes : pandas dataframe
+        Dataframe containing the ask volumes.
+    f : int
+        Frequency.
+        
+    Returns
+    -------
+    obj_fun : float
+        Objective function that has to be minimized.'''
+
+    dp = parameters[:M]
+    w = parameters[M:]
     imb = avg_imbalance(num_events, bid_volumes, ask_volumes, w, f)
     shape, loc, scale = stats.skewnorm.fit(imb)
     obj_fun = 0
     for m in range(M):
-        obj_fun += - 1 / M * np.log((imb[-1] * dp[m] + (1 - imb[-1]) * dp[-m]) \
-                                     * stats.skewnorm.pdf(imb[-1], shape, loc, scale))
-    return obj_fun
+        obj_fun += - (np.log((imb * dp[m] + (1 - imb) * dp[-m]) * stats.skewnorm.pdf(imb, shape, loc, scale))).sum()
+
+    return obj_fun/M/num_events
+
+
+    # for m in range(M):
+    #     obj_fun += - 1 / M * np.log((imb[m] * dp[m] + (1 - imb[m]) * dp[-m]) \
+    #                                  * stats.skewnorm.pdf(imb[m], shape, loc, scale))
+    # return obj_fun
 
 def callback(x, M, N, bid_volumes, ask_volumes, f, iteration):
-    print("Iteration :\n", iteration)
-    print(f"Current solution for dp:\n{x[:M + 1]} -> sum = {x[:M + 1].sum()}")
-    print(f"Current solution for w:\n{x[M + 1:]} -> sum = {x[M + 1:].sum()}",)
-    print("Objective value:\n", dp_dist(x, M, N, bid_volumes, ask_volumes, f))
-    print("-------------------------------")
+    with open(f'opt.txt', 'a', encoding='utf-8') as file:
+        file.write(f"\nIteration: {iteration}")
+        file.write(f"\nCurrent solution for dp:\n{x[:M]} -> sum = {x[:M].sum()}")
+        file.write(f"\nCurrent solution for w:\n{x[M:]} -> sum = {x[M:].sum()}",)
+        file.write(f"\nObjective value:\n{dp_dist(x, M, N, bid_volumes, ask_volumes, f)}")
+        file.write("-------------------------------\n")
+    
+    if iteration % 10 == 0:
+        plt.figure(tight_layout=True, figsize=(7,5))
+        plt.bar(list(range(-int((M-1)/2),int((M-1)/2) + 1)), x[:M])
+        plt.savefig(f'dp_p_{iteration}.png')
     obj_fun.append(dp_dist(x, M, N, bid_volumes, ask_volumes, f))
 
 def create_callback(M, N, bid_volumes, ask_volumes, f):
@@ -265,6 +506,7 @@ if __name__ == '__main__':
     parser.add_argument("-lob", "--lob_reconstruction", action='store_true', help='Reconstruct the limit order book')
     parser.add_argument("-f", "--freq", action='store_true', help='Compute the optimal frequency of sampling')
     parser.add_argument("-j", "--joint_imbalance", action='store_true', help='Compute the joint imbalance distribution')
+    parser.add_argument("-i", "--i_spoof", action='store_true', help='Compute the i-spoofing')
 
     args = parser.parse_args()
     levels = {'critical': logging.CRITICAL,
@@ -311,8 +553,6 @@ if __name__ == '__main__':
         orderbook.to_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
         message.to_pickle(f'{info[0]}_message_{info[1]}.pkl')
     
-
-
     orderbook = pd.read_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
     message = pd.read_pickle(f'{info[0]}_message_{info[1]}.pkl')
     period = [message['Time'].iloc[0].strftime('%Y-%m-%d'),  message['Time'].iloc[-1].strftime('%Y-%m-%d')]
@@ -321,13 +561,12 @@ if __name__ == '__main__':
     ret = (orderbook['Ask price 1'] / tick).diff()
     depth = np.quantile(ret[1:], 0.99)
     n = orderbook.shape[1]
-    bid_prices = orderbook[[f'Bid price {x}' for x in range(1, int(n/4)+1)]]
-    bid_volumes = orderbook[[f'Bid size {x}' for x in range(1, int(n/4)+1)]]
-    ask_prices = orderbook[[f'Ask price {x}' for x in range(1, int(n/4)+1)]]
-    ask_volumes = orderbook[[f'Ask size {x}' for x in range(1, int(n/4)+1)]]
+    bid_prices = np.array(orderbook[[f'Bid price {x}' for x in range(1, int(n/4)+1)]])
+    bid_volumes = np.array(orderbook[[f'Bid size {x}' for x in range(1, int(n/4)+1)]])
+    ask_prices = np.array(orderbook[[f'Ask price {x}' for x in range(1, int(n/4)+1)]])
+    ask_volumes = np.array(orderbook[[f'Ask size {x}' for x in range(1, int(n/4)+1)]])
     m, M = bid_prices.min().min(), ask_prices.max().max()
     logging.info('\nData loaded: {}.\nDataframe shape: {}.\nDepth: {}.\nPeriod: {} - {}'.format(info, orderbook.shape, depth, period[0], period[1]))
-
 
     if args.lob_reconstruction:
         N = int(input('Number of events to consider: '))
@@ -349,22 +588,23 @@ if __name__ == '__main__':
         plt.show()
     
     if args.dp_dist:
+        os.system('rm opt.txt')
         N = int(input('Number of events to consider: '))
         M = int(depth)
-        initial_params = np.random.uniform(0, 1, M+5)
+        initial_params = np.random.uniform(0, 1, M+4)
         print("Initial parameters:\n", initial_params)
         obj_fun = []
         constraint1 = {'type': 'eq', 'fun': constraint_fun1}
         constraint2 = {'type': 'eq', 'fun': constraint_fun2}
         constraints = [constraint1, constraint2]
-        bounds = [(0,1) for i in range(M+5)]
+        bounds = [(0,1) for i in range(M+4)]
         res = minimize(dp_dist, initial_params, args=(M, N, bid_volumes, ask_volumes, 1),  \
                        constraints=constraints, method='SLSQP', bounds=bounds, \
                         callback=create_callback(M, N, bid_volumes, ask_volumes, 1))
         print(res)
         print("Initial parameters:\n", initial_params)
-        np.save(res.x[:M+1], 'dp.npy')
-        np.save(res.x[M+1:], 'ws.npy')
+        np.save('dp.npy', res.x[:M])
+        np.save('ws.npy', res.x[M:])
         plt.figure(tight_layout=True, figsize=(5,5))
         plt.plot(obj_fun)
         plt.title('Objective function')
@@ -411,6 +651,14 @@ if __name__ == '__main__':
         sm.graphics.tsa.plot_acf(i_m, ax=ax[0], lags=100)
         sm.graphics.tsa.plot_acf(i_p, ax=ax[0], lags=100)
         plt.show()
+    
+    if args.i_spoof:
+        i_m, i_p = np.load('i_m.npy'), np.load('i_p.npy')
+        weight = np.array([0.6,0.5,0.2,0.1])
+        i_spoofing(i_m, weight, bid_volumes, ask_volumes, message)
+        
+
+
 
     if args.freq:
         l = []
@@ -427,10 +675,6 @@ if __name__ == '__main__':
 
 
 # Personal notes
-#WHICH PRICE IS THE BEST TO USE? MID PRICE OR THE PRICE OF THE FIRST LEVEL?
-# Fix the concatanation of the dataframes in data_preproc1 -> Done
-# Compute the best frequency of sampling with a target price variance of 2.
-
 
 # Note:
 # - dp e dq sono indipendenti? Non ne capisco il motivo.
