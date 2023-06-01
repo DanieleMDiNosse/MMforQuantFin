@@ -27,9 +27,10 @@ def cardano(a, b, c, d):
 
 def kyle_sim(Sigma_N, sgm_u, Sgm_0, n_steps):
     '''This function evaluates the parameters of the kyle multiperiod model at each time step
-    (at each auction) and the loss function. The idea is to reason backwards, starting from a guess of the final 
-    value of Sgm_N (the variance of the transaction price ad time t=T) and then compute the
-    corresponding value of Sgm_0*. At the end the loss  |Sgm_0 - Sgm_0*| is computed.'''
+    (at each auction) and the loss function. The idea is to reason backwards, starting from a 
+    guess of the final value of Sgm_N (the variance of the transaction price ad time t=T) and 
+    then compute the corresponding value of Sgm_0*. At the end the loss  |Sgm_0 - Sgm_0*| is 
+    computed and compared with the thresholds of the optimization algorithm.'''
 
     delta_t = 1/n_steps # could also be a vector if trades are irregularly spaced
     Sigma = np.zeros(n_steps+1)
