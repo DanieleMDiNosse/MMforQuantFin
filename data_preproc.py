@@ -31,7 +31,7 @@ import os
 from tqdm import tqdm
 import argparse
 import logging
-from scipy.optimize import minimize
+from scipy.optimize import minimize, NonlinearConstraint, LinearConstraint
 import multiprocessing as mp
 import numba as nb
 import time
@@ -338,8 +338,7 @@ def lob_video(image_folder, info):
     cv2.destroyAllWindows()
     video_writer.release()
 
-# @nb.njit
-def sq_dist_objective(f, tick_ask_price, target_var=2):
+def sq_dist_objective(f, tick_ask_price):
     # ask_price_fmean = np.array([tick_ask_price[t-f:t].mean() for t in range(f, tick_ask_price.shape[0])])
     # ask_price_diff_var = np.diff(ask_price_fmean).var()
     # sq_dist = (ask_price_diff_var - target_var)**2
@@ -369,8 +368,44 @@ def dot_product(a, b):
         result += a[i] * b[i]
     return result
 
-# @nb.njit
-def avg_imbalance(num_events, bid_volumes, ask_volumes, weight, f, bootstrap=False):
+def volumes_fsummed(N, f, bid_volumes, ask_volumes):
+    '''This function takes as input the number of events, the frequency, the bid and ask volumes and returns
+    the bid and ask volumes summed over f events.
+    
+    Parameters
+    ----------
+    N : int
+        Number of events.
+    f : int
+        Frequency.
+    bid_volumes : pandas dataframe
+        Dataframe containing the bid volumes.
+    ask_volumes : pandas dataframe
+        Dataframe containing the ask volumes.
+    
+    Returns
+    -------
+    bid_volumes_fsummed : numpy array
+        Array containing the bid volumes summed over f events.
+    ask_volumes_fsummed : numpy array
+        Array containing the ask volumes summed over f events.'''
+
+    bid_volumes_fsummed = np.array([bid_volumes[i:i+f].sum(axis=0) for i in range(0, N-f)])
+    ask_volumes_fsummed = np.array([ask_volumes[i:i+f].sum(axis=0) for i in range(0, N-f)])
+
+    return bid_volumes_fsummed, ask_volumes_fsummed
+
+@nb.njit
+def avg_imbalance2(num_events, bid_volumes_fsummed, ask_volumes_fsummed, weight, f):
+    imb = []
+    for i in range(0, num_events - f):
+        num = dot_product(bid_volumes_fsummed[i], weight)
+        det = dot_product((bid_volumes_fsummed[i] + ask_volumes_fsummed[i]), weight)
+        imb.append(num/det)
+    imb = np.array(imb)
+    return imb
+
+def avg_imbalance(num_events, bid_volumes, ask_volumes, weight, f, bootstrap=False, save_output=False):
     '''This function takes as input the number of events, the bid and ask volumes, the weight and the frequency
     and returns the average imbalance.
 
@@ -394,9 +429,9 @@ def avg_imbalance(num_events, bid_volumes, ask_volumes, weight, f, bootstrap=Fal
 
     lev = weight.shape[0]
     imb = []
-    for i in tqdm(range(0, num_events), desc='Computing average imbalance'):
-        num = dot_product(bid_volumes[i:i+f, :lev][0], weight)
-        det = dot_product((bid_volumes[i:i+f, :lev][0] + ask_volumes[i:i+f, :lev][0]), weight)
+    for i in tqdm(range(0, num_events - f), desc='Computing average imbalance'):
+        num = dot_product(bid_volumes[i:i+f, :lev].sum(axis=0), weight)
+        det = dot_product((bid_volumes[i:i+f, :lev].sum(axis=0) + ask_volumes[i:i+f, :lev].sum(axis=0)), weight)
         imb.append(num/det)
     imb = np.array(imb)
     shape, loc, scale = stats.skewnorm.fit(imb)
@@ -421,13 +456,14 @@ def avg_imbalance(num_events, bid_volumes, ask_volumes, weight, f, bootstrap=Fal
         loc_error = np.std(loc_samples)
         scale_error = np.std(scale_samples)
 
-        np.save(f'imbalance_{info[0]}_{info[1]}_errors', np.array([shape_error, loc_error, scale_error]))
+        if save_output:
+            np.save(f'imbalance_{info[0]}_{info[1]}_errors', np.array([shape_error, loc_error, scale_error]))
     
-    np.save(f'imbalance_{info[0]}_{info[1]}', imb)
-    np.save(f'imbalance_{info[0]}_{info[1]}_params', np.array([shape, loc, scale]))
-    shape_error = 0
-    loc_error = 0
-    scale_error = 0
+    else:
+        if save_output:
+            np.save(f'imbalance_{info[0]}_{info[1]}', imb)
+            np.save(f'imbalance_{info[0]}_{info[1]}_params', np.array([shape, loc, scale]))
+        shape_error, loc_error, scale_error = 0, 0, 0
 
     return imb, np.array([shape, loc, scale]), np.array([shape_error, loc_error, scale_error])
 
@@ -532,7 +568,7 @@ def direction_of_hlo(message):
     print(hlo)
     return hlo
 
-def dp_dist(parameters, M, tick_ask_price, bid_volumes, ask_volumes, num_events, f):
+def dp_dist(parameters, M, ask_prices_fdiff, bid_volumes, ask_volumes, num_events, f, depth, constr=True):
     '''This function takes as input the parameters, the number of levels, the number of events, the bid and ask volumes,
     the frequency and returns the (negative) objective function that has to be minimize to estimate the values of
     dp^+ and w (ML estimation).
@@ -557,44 +593,74 @@ def dp_dist(parameters, M, tick_ask_price, bid_volumes, ask_volumes, num_events,
     obj_fun : float
         Objective function that has to be minimized.'''
 
-    dp = parameters[:M]
-    w = parameters[M:]
-    imb, _, _ = avg_imbalance(num_events, bid_volumes, ask_volumes, w, f)
-    imb = imb[::f]
-    shape, loc, scale = stats.skewnorm.fit(imb)
+    # dp = np.exp(parameters[:M]) # set the first M values for dp (depth*2 + 1)
+    # w = parameters[M:] # set the last M values for w (4 by default)
+    # parameters = np.exp(parameters)
+    imb = avg_imbalance2(num_events, bid_volumes_fsummed, ask_volumes_fsummed, parameters[M:], f) # evaluate the imbalance
+    shape, loc, scale = stats.skewnorm.fit(imb) # compute the parameters of the fitted skew 
+                                                # normal distribution.
+    imb = imb[::f] # sample the imbalance every f events. Note that the imbalance is
+                   # computed averaging the f previous events every time. It starts
+                   # from the f-th event and goes on until num_events (N). Hence, it has
+                   # one value for every events in the LOB, starting from the f-th one.
+                   # In order to have the pair (x_m, i_m) where x_m represents the price
+                   # change "influenced" by i_m (so I see i_m at time t and check the price
+                   # change at time t+f). 
     obj_fun = 0
-    xs = imb.copy()
-    xs.sort()
-    for i in tqdm(range(imb.shape[0] - 1)):
-        if np.abs(ask_prices_fdiff[i]) > int((M-1)/2):
+    for i in range(imb.shape[0] - 1):
+        if np.abs(ask_prices_fdiff[i]) > int((M-1)/2): # if the difference exceeds the max depth, ignore it
             pass
         else:
-            idx = np.where(xs==imb[i])[0][0]
-            obj_fun += - np.log((imb[i] * dp[ask_prices_fdiff[i]] + (1 - imb[i]) * dp[-ask_prices_fdiff[i]]) * stats.skewnorm.pdf(xs, shape, loc, scale)[idx])
+            # x, dx = np.linspace(imb[i]-0.005, imb[i]+0.005, 100, retstep=True)
+            # p_imb = (stats.skewnorm.pdf(x, shape, loc, scale)*dx).sum() # compute the probability of the imbalance. Remember that
+                                                                        # the probability is the area under the curve (pdf is the
+                                                                        # derivative of the cumulative distribution functoion). 
+                                                                        # Hence, I have to multiply the pdf by the step dx and then 
+                                                                        # sum over all the values of x within a specified range. 
+            if constr:
+                penalty = 0
+            else:
+                # penalty = 100 * (np.array([max(1, np.log(dp[:M]).sum())]) + np.array([max(1, dp[:M].sum())])) # compute the penalty
+                penalty = 0
 
-    return obj_fun/M
+            dp_pp = parameters[:M][ask_prices_fdiff[i] + depth]
+            dp_pm = parameters[:M][-ask_prices_fdiff[i] + depth]
+            p_im = stats.skewnorm.pdf(imb[i], shape, loc, scale)
 
-def callback(x, M, tick_ask_price, bid_volumes, ask_volumes, N, f, iteration):
+            obj_fun += - np.log((imb[i] * dp_pp + (1 - imb[i]) * dp_pm) * p_im) # compute the objective function (negative log-likelihood)
+
+        if np.isnan(obj_fun):
+            print('NAN')
+            print(ask_prices_fdiff[i])
+        if np.isinf(obj_fun):
+            print('INF')
+            print(ask_prices_fdiff[i])
+    return obj_fun/imb.shape[0]
+
+def callback(x, M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, iteration):
+    print(f"Iteration: {iteration}")
     with open(f'opt.txt', 'a', encoding='utf-8') as file:
         file.write(f"\nIteration: {iteration}")
         file.write(f"\nCurrent solution for dp:\n{x[:M]} -> sum = {x[:M].sum()}")
-        file.write(f"\nCurrent solution for w:\n{x[M:]} -> sum = {x[M:].sum()}",)
-        file.write(f"\nObjective value:\n{dp_dist(x, M, tick_ask_price, bid_volumes, ask_volumes, N, f)}")
+        file.write(f"\nCurrent solution for w:\n{x[M:]} -> sum = {x[M:].sum()}")
+        file.write(f"\nObjective value:\n{dp_dist(x, M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, depth)}")
         file.write("-------------------------------\n")
     
-    if iteration % 10 == 0:
+    if iteration % 3 == 0:
         plt.figure(tight_layout=True, figsize=(7,5))
         plt.bar(list(range(-int((M-1)/2),int((M-1)/2) + 1)), x[:M])
         plt.savefig(f'images/dp_p_{iteration}_{info[0]}_{info[1]}.png')
         plt.close()
-    obj_fun.append(dp_dist(x, M, tick_ask_price, bid_volumes, ask_volumes, N, f))
+    obj_fun.append(dp_dist(x, M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, depth))
 
-def create_callback(M, tick_ask_price, bid_volumes, ask_volumes, N, f):
+def create_callback(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f):
     iteration = 0
-    def callback_closure(x):
+    def callback_closure(x, *args):
+        if len(args) == 1:
+            state = args[0]
         nonlocal iteration
         iteration += 1
-        callback(x, M, tick_ask_price, bid_volumes, ask_volumes, N, f, iteration)
+        callback(x, M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, iteration)
     return callback_closure
 
 def constraint_fun1(x):
@@ -602,6 +668,15 @@ def constraint_fun1(x):
 
 def constraint_fun2(x):
     return x[x.shape[0] - 4:].sum() - 1
+
+def insert_zeros_between_values(v, k):
+    new_array = []
+    for i in range(len(v)):
+        new_array.append(v[i])
+        for j in range(k):
+            new_array.append(np.log(-1))
+    return np.array(new_array[:-k])
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -674,34 +749,55 @@ if __name__ == '__main__':
         orderbook, message, m, M = data_preproc(paths_lob, paths_msg, N_days)
         orderbook.to_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
         message.to_pickle(f'{info[0]}_message_{info[1]}.pkl')
-    
+
     orderbook = pd.read_pickle(f'{info[0]}_orderbook_{info[1]}.pkl')
     message = pd.read_pickle(f'{info[0]}_message_{info[1]}.pkl')
     period = [message['Time'].iloc[0].strftime('%Y-%m-%d'),  message['Time'].iloc[-1].strftime('%Y-%m-%d')]
-    # f = int(input('Frequency of sampling: '))
-    # orderbook, message = orderbook.iloc[::f].reset_index(drop=True), message.iloc[::f].reset_index(drop=True)
-    
-    # ret = (orderbook['Ask price 1'] / tick).diff()
-    # value, count = np.unique(ret[1:], return_counts=True)
-    # x = np.arange(value.min(), value.max()+1)
-    # mask = np.in1d(x, value)
-    # y = np.zeros_like(x)
-    # y[mask] = count
-    # y = y / count.sum()
-    # plt.figure(tight_layout=True, figsize=(8,5))
-    # plt.bar(x, y, color='green', edgecolor='black')
-    # plt.title(fr'$r_t$ for {info[0]} from {period[0]} to {period[1]}')
-    # plt.xlabel('Ticks deviation')
-    # plt.ylabel('Frequency')
-    # plt.savefig(f'images/ret_{info[0]}_{period[0]}_{period[1]}_{f}.png')
 
-    ''' As the maximal depth for the distribution dp and dq, we take the difference between 
+    '''The optimal sampling frequency is computed minimizing the square distance betweem
+    the empirical variance of the ask price sampled at each f events and the target variance.
+    The target variance is set to 2. The optimal frequency f* depends on the number of events
+    I want to consider. Hence, I have to compute it every time I change the number of events.'''
+
+    logging.info('Computing optimal frequency of sampling')
+    N = int(input(f'Number of events to consider (out of {orderbook.shape[0]}): '))
+    obj_fun = []
+    variance = []
+    tick_ask_price = (orderbook.values[:,0] / tick)[:N]
+    for f in tqdm(range(1, 100)):
+        var = sq_dist_objective(f, tick_ask_price)
+        variance.append(var)
+    obj_fun = (np.array(variance)-2)**2
+
+    fig, ax = plt.subplots(2, 1, figsize=(10,7))
+    ax[0].plot((np.array(variance)-2)**2, 'k')
+    ax[0].set_title('Objective function', fontsize=15)
+    ax[0].legend([f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}'])
+
+    ax[1].plot(variance, 'k')
+    ax[1].set_title('Variance', fontsize=15)
+    ax[0].vlines(np.where(obj_fun == obj_fun.min())[0][0], -0.2, obj_fun.max(), linestyles='dashed', color='red', label=f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}')
+    plt.savefig(f'images/freq_{info[0]}_{info[1]}.png')
+
+    f = np.where(obj_fun == obj_fun.min())[0][0] + 1
+    print()
+    
+    '''Once f* is evaluated, I have to compute the support of the distributions dp and dq.
+    The support is the maximal depth of the LOB that I want to consider.
+    
+    As the maximal depth for the distribution dp and dq, we take the difference between 
     the 99.5th and 0.5th quantile to obtain the extreme values between which there is the
     99% of the data. Then we divide this value by 2 to obtain the maximal depth in the directions
     of the bid and ask prices. We are assuming symmetry.'''
-    # quantile05 = np.quantile(ret[1:], 0.005)
-    # quantile95 = np.quantile(ret[1:], 0.995)
-    # depth = int((quantile95 - quantile05) / 2)
+
+    orderbook, message = orderbook.iloc[::f].reset_index(drop=True), message.iloc[::f].reset_index(drop=True)
+    ret = (orderbook['Ask price 1'] / tick).diff()
+    quantile05 = np.quantile(ret[1:], 0.005)
+    quantile95 = np.quantile(ret[1:], 0.995)
+    depth = int((quantile95 - quantile05) / 2)
+
+    orderbook = pd.read_pickle(f'{info[0]}_orderbook_{info[1]}.pkl') # Re-load the original files
+    message = pd.read_pickle(f'{info[0]}_message_{info[1]}.pkl')
     n = orderbook.shape[1]
     bid_prices = np.array(orderbook[[f'Bid price {x}' for x in range(1, int(n/4)+1)]])
     bid_volumes = np.array(orderbook[[f'Bid size {x}' for x in range(1, int(n/4)+1)]])
@@ -709,14 +805,15 @@ if __name__ == '__main__':
     ask_volumes = np.array(orderbook[[f'Ask size {x}' for x in range(1, int(n/4)+1)]])
     m, M = bid_prices.min().min(), ask_prices.max().max()
 
-    if args.MSFT:
-        depth = 3
-    if args.TSLA:
-        depth = 10
-    if args.AMZN:
-        depth = 6
+    # if args.MSFT:
+    #     depth = 3
+    # if args.TSLA:
+    #     depth = 10
+    # if args.AMZN:
+    #     depth = 6
     
-    logging.info('\nData loaded: {}.\nDataframe shape: {}.\nDepth: {}.\nPeriod: {} - {}'.format(info, orderbook.shape, depth, period[0], period[1]))
+    logging.info('\nData loaded: {}.\nDataframe shape: {}.\nf: {}.\nDepth: {}.\nPeriod: {} - {}'.format(info, orderbook.shape, f, depth, period[0], period[1]))
+    print()
 
     if args.lob_reconstruction:
         N = int(input('Number of events to consider: '))
@@ -755,26 +852,87 @@ if __name__ == '__main__':
     
     if args.dp_dist:
         os.system('rm opt.txt')
-        N = int(input('Number of events to consider: '))
-        f = int(input('Frequency of sampling: '))
         M = int(depth)*2 + 1
         initial_params = np.random.uniform(0, 1, M+4)
-        print("Initial parameters:\n", initial_params)
+        # initial_params[:M] = np.exp(initial_params[:M]) / np.exp(initial_params[:M]).sum()
+        # initial_params[M:] = initial_params[M:] / initial_params[M:].sum()
+        # logging.info(f"\nInitial parameters:\n {initial_params}\nSum of all dp's:\n{initial_params[:M].sum()}\nSum of all w's:\n{initial_params[M:].sum()}")
         obj_fun = []
-        constraint1 = {'type': 'eq', 'fun': constraint_fun1}
-        constraint2 = {'type': 'eq', 'fun': constraint_fun2}
-        constraints = [constraint1, constraint2]
-        bounds = [(0,1) for i in range(M+4)]
+
+        optimizer = int(input('Choose optimizer (1: trust-constr, 2: SLSQP, 3: Nelder-Mead (unconstrained)): '))
+        if optimizer == 1:
+            optimizer = 'trust-constr'
+            A1 = np.append(np.ones(M), np.zeros(4))
+            A2 = np.append(np.zeros(M), np.ones(4))
+            b = np.array([1])
+            constraint1 = LinearConstraint(A1, b, b)
+            constraint2 = LinearConstraint(A2, b, b)
+            constraints = [constraint1, constraint2]
+            bounds = [(0,1) for i in range(M+4)]
+        elif optimizer == 2:
+            optimizer = 'SLSQP'
+            constraint1 = {'type': 'eq', 'fun': constraint_fun1}
+            constraint2 = {'type': 'eq', 'fun': constraint_fun2}
+            constraints = [constraint1, constraint2]
+            bounds = [(0,1) for i in range(M+4)]
+        elif optimizer == 3:
+            optimizer = 'Nelder-Mead'
+            constr = False
+        
+
+        
+        # Prepare the data for the optimization
         tick_ask_price = orderbook.values[:,0] / tick
-        ask_prices_fsampled = tick_ask_price[::f][:N]
-        ask_prices_fdiff = np.diff(ask_prices_fsampled).astype(int)
-        res = minimize(dp_dist, initial_params, args=(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f),  \
-                       constraints=constraints, method='SLSQP', bounds=bounds, \
-                        callback=create_callback(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f))
+        ask_prices_fsampled = tick_ask_price[:N][::f] # ::f means that I take the first element and then I skip f elements and take that one and so on
+        ask_prices_fdiff = np.diff(ask_prices_fsampled).astype(int)[1:] # Compute the difference between the ask prices sampled every f events.
+                                                                        # Remember that you want to consider the price change between t and t+f
+                                                                        # and the value of the imbalance at time t. The first element of ask_prices_fdiff
+                                                                        # is the price change between the initial time and the f events after. Since I do not
+                                                                        # have the value of the imbalance at the initial time, I have to skip it. Indeed,
+                                                                        # the first element of the imbalance is the one computed considering the f events
+                                                                        # after the initial time.
+        bid_volumes_fsummed, ask_volumes_fsummed = volumes_fsummed(N, f, bid_volumes, ask_volumes)                                    
+
+        fig, ax = plt.subplots(2, 1, figsize=(8,5), tight_layout=True)
+        # imb, _, _ = avg_imbalance(N, bid_volumes, ask_volumes, np.array([0.6,0.5,0.2,0.1]), f)
+        imb = avg_imbalance2(N, bid_volumes_fsummed, ask_volumes_fsummed, np.array([0.6,0.5,0.2,0.1]), f)
+        imb = np.append(np.zeros(f), imb)
+        ax[0].plot(imb, 'k')
+        ax[0].vlines(np.arange(0, imb.shape[0])[f:][::f], 0, 1, linestyles='dashed', color='red')
+        ax[0].set_title('Imbalance (with arbitrary weights)')
+        ax[1].plot(tick_ask_price[:N], 'k')
+        ax[1].vlines(np.arange(f, tick_ask_price[:N].shape[0])[::f], tick_ask_price[:N].min(), tick_ask_price[:N].max(), linestyles='dashed', color='red')
+        ax[1].set_title('Ask price')
+        ax1 = ax[1].twinx()
+        ask_prices_fdiff_extended = insert_zeros_between_values(ask_prices_fdiff, f-1)
+        ax1.scatter(np.arange(f, ask_prices_fdiff_extended.shape[0]), ask_prices_fdiff_extended[:-f], color='red', s=15)
+        ax[0].set_xlim(-10, 500)
+        ax[1].set_xlim(-10, 500)
+        plt.show()
+
+        value, count = np.unique(ask_prices_fdiff, return_counts=True)
+        x = np.arange(value.min(), value.max()+1)
+        mask = np.in1d(x, value)
+        y = np.zeros_like(x)
+        y[mask] = count
+        y = y / count.sum()
+        plt.figure(tight_layout=True, figsize=(8,5))
+        plt.bar(x, y, color='green', edgecolor='black')
+        plt.title(f'Price change sampled every {f} events')
+        callback_func = create_callback(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f)
+
+        if optimizer == 'Nelder-Mead':
+            res = minimize(dp_dist, initial_params, args=(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, depth, constr), \
+                        method=optimizer, callback=callback_func)
+        else:
+            res = minimize(dp_dist, initial_params, args=(M, ask_prices_fdiff, bid_volumes, ask_volumes, N, f, depth),  \
+                       constraints=constraints, method=optimizer, bounds=bounds, \
+                        callback=callback_func)
+
         with open(f'opt.txt', 'a', encoding='utf-8') as file:
             file.write(f"\nFINAL RESULT: {res}")
-        print(res)
-        print("Initial parameters:\n", initial_params)
+        print(res.x)
+        print("Initial parameters:\n", np.exp(initial_params))
         np.save('dp.npy', res.x[:M])
         np.save('ws.npy', res.x[M:])
         plt.figure(tight_layout=True, figsize=(5,5))
@@ -783,7 +941,7 @@ if __name__ == '__main__':
         plt.figure(tight_layout=True, figsize=(5,5))
         plt.bar(list(range(-int((M-1)/2),int((M-1)/2) + 1)), res.x[:M], color='green', edgecolor='black')
         plt.title(r'$dp^+$')
-        plt.savefig(f'images/dp_p_{info[0]}_{info[1]}_{f}_{N}.png')
+        plt.savefig(f'images/dp_p_{info[0]}_{info[1]}_{f}_{N}_{optimizer}.png')
         plt.show()
     
     if args.imbalance_plot:
@@ -796,7 +954,6 @@ if __name__ == '__main__':
         else:
             bootstrap = False
         if var == 1:
-            N = int(input('Number of events to consider: '))
             imb, parameters, errors = avg_imbalance(N, bid_volumes, ask_volumes, weight, f, bootstrap=bootstrap)
             shape, loc, scale = parameters
             shape_error, loc_error, scale_error = errors
@@ -826,7 +983,6 @@ if __name__ == '__main__':
         var = int(input('Recompute (1) or load (2) the imbalance?: '))
 
         if var == 1:
-            N = int(input('Number of events to consider: '))
             weight = np.array([0.6,0.5,0.2,0.1])
             imb, params, errors = avg_imbalance(N, bid_volumes, ask_volumes, weight, f=1, bootstrap=False)
             np.save('imbalance_{info[0]}_{info[1]}.npy', imb)
@@ -863,38 +1019,11 @@ if __name__ == '__main__':
         i_m, i_p = np.load('i_m.npy'), np.load('i_p.npy')
         weight = np.array([0.6,0.5,0.2,0.1])
         i_spoofing(i_m, weight, bid_volumes, ask_volumes, message)
-        
-    if args.freq:
-        obj_fun = []
-        variance = []
-        tick_ask_price = orderbook.values[:,0] / tick
-        for f in tqdm(range(1, 100)):
-            var = sq_dist_objective(f, tick_ask_price, tick)
-            # obj_fun.append(obj)
-            variance.append(var)
-        obj_fun = (np.array(variance)-2)**2
-
-        fig, ax = plt.subplots(2, 1, figsize=(10,7))
-        ax[0].plot((np.array(variance)-2)**2)
-        ax[0].set_title('Objective function', fontsize=15)
-        ax[1].plot(variance)
-        ax[1].set_title('Variance', fontsize=15)
-        ax[0].vlines(np.where(obj_fun == obj_fun.min())[0][0], -0.2, obj_fun.max(), linestyles='dashed', label=f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}')
-        plt.legend([f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}'])
-        plt.savefig(f'images/freq_{info[0]}_{info[1]}.png')
-        print(f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}')
-
-        # plt.figure()
-        # plt.plot((np.array(variance)-2)**2)
 
 
     plt.show()
 
-# Personal notes
-
-# Note:
-# - dp e dq sono indipendenti? Non ne capisco il motivo.
-# - A cosa serve stimare la frequenza ottimale? Ai fini del rilevamento di spoofing su
-# singoli asset meglio tenere tutte le informazioni che si hanno a disposizione, no?
-# In fin dei conti non mi interessa fare il confronto fra i diversi asset.
-# - E' corretto il modo che ho usato per valutare dp+?
+    ''' Durante la procedure di ottimizzazione quello che faccio è considerare ogni volta solamente due valori di dp+ (dp[-xm] e dp[xm])).
+    Di conseguenza è come se per ogni osservazione (i_m, x_m) io cerco di ottimizzare solamente due valori di dp+ e non tutti quanti
+    
+    Ottengo sempre una distribuzione di dp che ha per valore non nullo il primo e basta, non t'arrabbià!! (dp[0])'''
