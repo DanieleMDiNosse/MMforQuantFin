@@ -18,7 +18,7 @@ Instead, Direction is:
 Orderbook file's columns are as follows:
 Ask price 1, Ask size 1, Bid price 1, Bid size 1, Ask price 2, Ask size 2, Bid price 2, Bid size 2, ...
 
-For TSLA the tick size in 2015 was 0.01 USD (100 in the data)
+For TSLA the tick size in 2013 was 0.01 USD (100 in the data)
 
 IMPORTANTE NOTE
 ---------------
@@ -42,7 +42,7 @@ import warnings
 from datetime import datetime, timedelta
 from scipy import stats
 import statsmodels.api as sm
-from scipy.optimize import root, fsolve
+from scipy.optimize import root, fsolve, leastsq
 
 def data_preproc(paths_lob, paths_msg, N_days):
     '''This function takes as input the paths of the orderbook and message files for a period of N_days and returns
@@ -291,7 +291,7 @@ def lob_reconstruction(N, tick, m, M, bid_prices, bid_volumes, ask_prices, ask_v
         tick_labels = p_line[tick_positions].astype(int)
 
         # Plot the limit order book snapshot
-        plt.figure(tight_layout=True, figsize=(15,5))
+        plt.figure(tight_layout=True, figsize=(13,5))
         plt.title(f'Limit Order Book {event}')
         plt.bar(np.arange(p_line.shape[0]), volumes, width=1, color=colors)
         plt.vlines(mid_price_loc, 0, volumes.max(), color='black', linestyle='--')
@@ -315,7 +315,7 @@ def lob_video(image_folder, info):
     -------
     None.'''
 
-    frame_width = 1500
+    frame_width = 1300
     frame_height = 500
     fps = 24.0
     output_filename = f"LOBvideo_{info[0]}_{info[1]}.mp4"
@@ -579,9 +579,15 @@ def joint_imbalance(message, imbalance, N, f):
     return i_mm, i_pm, i_mp, i_pp
 
 def implicit_eq_i_spoof(x, i_mm, w_k, Q_k, rho_t, mu_p, v_k):
-    implicit_equation = 1 / x - 1 / i_mm - (1 - i_mm) * w_k / Q_k * max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * x**2 /
+    implicit_equation = 1 / x - 1 / i_mm - (1 - i_mm) / i_mm * w_k / Q_k * max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * x**2 /
                                                                   - (Q_k * rho_t + v_k))
     return implicit_equation
+
+def square_dist_ispoof(i, i_mm, w_k, Q_k, rho_t, mu_p, v_k):
+    lhs = 1 / i
+    rhs = np.array([1 / i_mm + (1 - i_mm) / i_mm * w_k / Q_k * \
+                            max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * i[t]**2 -  (Q_k * rho_t + v_k)) for t in range(i.shape[0])])
+    return (lhs - rhs)**2
 
 def MO_volumes(message, N, f):
 
@@ -656,30 +662,29 @@ def i_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, idxs, x0):
     a = np.zeros(idxs.shape[0])
     for t, tt in zip(idxs, np.arange(idxs.shape[0])):
         a[tt] = (ask_volumes[t:t-f:-1].sum(axis=0).sum() / (weight.shape[0]*f))
-        rho[tt] = weight.shape[0] * H[t:t-f:-1].sum() / a[tt]
+        rho[tt] = H[t:t-f:-1].sum() / a[tt]
     
     mu_p = sum(value * probability for value, probability in zip(np.arange(-depth, depth+1), dp_p))
     
     i_spoof = np.zeros(shape=[i_mm.shape[0], depth]) # One value of i_spoof for each time and each level k
+    v_spoof = np.zeros(shape=[i_mm.shape[0], depth])
     Q = np.zeros(shape=depth)
     v = np.zeros(shape=depth)
     for k in tqdm(range(depth), desc='Levels'):
         Q[k] = dq[depth + k + 1:].sum()
         v[k] = np.array([(i-k) * dq[depth + k + 1:] for i in range(depth + k + 1, 2*depth+1)]).sum()
-        # t runs over all the times of the market orders
-        c0 = 0
-        for t in zip(range(i_mm.shape[0])):
-            solution = fsolve(implicit_eq_i_spoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
-            check = max(0, 2 * rho[t] * weight[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * solution**2 - (Q[k] * rho[t] + v[k]))
-            if check == 0:
-                c0 += 1
-            # if solution > i_mm[t]:
-            #     i_spoof[t, k] = np.log(-1)
-            # else:
-            i_spoof[t, k] = solution
-        print(c0/i_mm.shape[0])
+        i = np.linspace(0.001,1, i_mm.shape[0])
+        for t in tqdm(range(i_mm.shape[0])):
+            solution = leastsq(square_dist_ispoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
+            i_spoof[t, k] = solution[0]
+            # solution = root(implicit_eq_i_spoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
+            v_spoof[t, k] = a[t] / Q[k] * max(0, 2 * rho[t] * weight[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k]))
+            # # if solution > i_mm[t]:
+            # #     i_spoof[t, k] = np.log(-1)
+            # # else:
+            # i_spoof[t, k] = solution.x
 
-    return i_spoof, Q, v, a, rho, mu_p
+    return i_spoof, v_spoof, Q, v, a, rho, mu_p
 
 def i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs):
     
@@ -689,16 +694,6 @@ def i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights,
     spoof_term = np.array([v_spoof[:, lev] * weights[lev] for lev in range(level)]).sum(axis=0)
     i_spoof = b / (a + b + spoof_term)
     return i_spoof
-
-def v_spoofing(i_spoof, i_mm, w, Q, v, a, idxs, rho, mu_p):
-    v_spoof = np.zeros(shape=[i_spoof.shape[0], w.shape[0]])
-    for k in tqdm(range(w.shape[0]), desc='Levels'):
-        for t, ts in tqdm(zip(range(i_spoof.shape[0]), idxs)):
-            if i_spoof[t, k] == 0:
-                v_spoof[t, k] = 0
-            else:
-                v_spoof[t, k] = a[t] / Q[k] * max(0, (2 * rho[t] * w[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k])))
-    return v_spoof
 
 def dp_dist(parameters, M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, num_events, f, depth):
     '''This function takes as input the parameters, the number of levels, the number of events, the bid and ask volumes,
@@ -824,8 +819,8 @@ if __name__ == '__main__':
     logging.basicConfig(level=levels[args.log])
     np.random.seed(666)
 
-    tick = 100 # Set the tick size. For TSLA (MSFT) the tick size in 2015(2018) was 0.01 USD (100 in the data)
-    info = [['TSLA', '2015-01-01'], ['MSFT', '2018-04-01'], ['AMZN', '2012-06-21']]
+    tick = 100 # Set the tick size. For TSLA (MSFT) the tick size in 2013(2018) was 0.01 USD (100 in the data)
+    info = [['TSLA', '2013-01-01'], ['MSFT', '2018-04-01'], ['AMZN', '2012-06-21']]
     if args.TSLA:
         info = info[0]
     elif args.MSFT:
@@ -839,7 +834,7 @@ if __name__ == '__main__':
         paths_lob = []
         paths_msg = []
         if args.TSLA:
-            folder_path = 'data/TSLA_2015-01-01_2015-01-31_10'
+            folder_path = 'data/TSLA_2013-01-01_2013-01-31_10'
             filenames = os.listdir(folder_path)
             for file in filenames:
                 if 'orderbook' in file:
@@ -882,11 +877,11 @@ if __name__ == '__main__':
     obj_fun, variance, f = optimal_sampling(N, orderbook, tick, target_var)
     fig, ax = plt.subplots(2, 1, figsize=(10,7))
     ax[0].plot((np.array(variance) - target_var)**2, 'k')
-    ax[0].set_title('Objective function', fontsize=15)
+    ax[0].set_title('Objective function', fontsize=13)
     ax[0].legend([f'Minimum at f = {f}'])
     ax[0].set_xlabel('Frequency')
     ax[1].plot(variance, 'k')
-    ax[1].set_title('Variance', fontsize=15)
+    ax[1].set_title('Variance', fontsize=13)
     ax[1].set_xlabel('Frequency')
     ax[0].vlines(np.where(obj_fun == obj_fun.min())[0][0], -0.2, obj_fun.max(), linestyle='dashed', color='red', label=f'Minimum at f = {np.where(obj_fun == obj_fun.min())[0][0] + 1}')
     plt.savefig(f'images/freq_{info[0]}_{info[1]}.png')
@@ -976,7 +971,7 @@ if __name__ == '__main__':
         ax[1].set_title('Ask price')
         ax1 = ax[1].twinx()
         ask_prices_fdiff_extended = insert_zeros_between_values(ask_prices_fdiff, f-1)
-        ax1.scatter(np.arange(f, ask_prices_fdiff_extended.shape[0]), ask_prices_fdiff_extended[:-f], color='red', s=15)
+        ax1.scatter(np.arange(f, ask_prices_fdiff_extended.shape[0]), ask_prices_fdiff_extended[:-f], color='red', s=13)
         ax[0].set_xlim(-10, 500)
         ax[1].set_xlim(-10, 500)
         plt.show()
@@ -1029,7 +1024,7 @@ if __name__ == '__main__':
             shape, loc, scale = np.load(f'imbalance_{info[0]}_{info[1]}_{f}_params.npy')
             shape_error, loc_error, scale_error = np.load(f'imbalance_{info[0]}_{info[1]}_{f}_errors.npy')
         x = np.linspace(np.min(imb), np.max(imb), 100)
-        plt.figure(tight_layout=True, figsize=(15,5))
+        plt.figure(tight_layout=True, figsize=(13,5))
         plt.plot(x, stats.skewnorm.pdf(x, shape, loc, scale), 'r-', label=fr'Skew Normal {shape:.2f}$\pm${(2 * shape_error):.2f}, {loc:.2f}$\pm${(2 * loc_error):.2f}, {scale:.2f}$\pm${(2*scale_error):.2f}')
         plt.hist(imb, bins=100, histtype='bar', density=True, edgecolor='black', alpha=0.5, label=f'{weight}')
         plt.xlabel('Imbalance')
@@ -1058,10 +1053,10 @@ if __name__ == '__main__':
                 np.load(f'i_pp_{info[0]}_{period[0]}_{period[1]}_{f}.npy')
 
         plt.figure(tight_layout=True, figsize=(7,7))
-        plt.scatter(i_mm, i_pm, s=15, c='green', edgecolors='black', alpha=0.65)
-        plt.title(r'Joint imbalance distribution of $(i_{-}, i_{+})$ for sell MOs', fontsize=15)
-        plt.xlabel(r'$i_{-}$', fontsize=15)
-        plt.ylabel(r'$i_{+}$', fontsize=15)
+        plt.scatter(i_mm, i_pm, s=13, c='green', edgecolors='black', alpha=0.65)
+        plt.title(r'Joint imbalance distribution of $(i_{-}, i_{+})$ for sell MOs', fontsize=13)
+        plt.xlabel(r'$i_{-}$', fontsize=13)
+        plt.ylabel(r'$i_{+}$', fontsize=13)
         # sns.kdeplot(x=i_mm, y=i_pm, levels=5, colors='r', linewidths=1.5)
         plt.savefig(f'images/joint_imbalance_{info[0]}_{period[0]}_{period[1]}_{f}.png')
 
@@ -1072,11 +1067,11 @@ if __name__ == '__main__':
         imbalance can be attributed to market conditions (the ones that generates the correlation).'''
         # What about the correlation between the imbalance and the price change? And with the direction of the trade?
         fig, ax = plt.subplots(2, 1, figsize=(13,7))
-        fig.suptitle('Autocorrelation function of $i_{-}$ and $i_{+}$', fontsize=15)
+        fig.suptitle('Autocorrelation function of $i_{-}$ and $i_{+}$', fontsize=13)
         sm.graphics.tsa.plot_acf(i_mm, ax=ax[0], lags=100)
         sm.graphics.tsa.plot_acf(i_pm, ax=ax[1], lags=100)
-        ax[0].set_title(r'$i_{-}$', fontsize=15)
-        ax[1].set_title(r'$i_{+}$', fontsize=15)
+        ax[0].set_title(r'$i_{-}$', fontsize=13)
+        ax[1].set_title(r'$i_{+}$', fontsize=13)
         plt.savefig(f'images/autocorrelation_imip_{info[0]}_{period[0]}_{period[1]}_{f}.png')
     
     if args.i_spoof:
@@ -1107,89 +1102,74 @@ if __name__ == '__main__':
         dp_p = np.load(f'output/dp_p_{info[0]}_{info[1]}_{f}_{N}.npy') # Load the distribution of dp_p evaluated via the optimization
 
         logging.info('Computing i_spoof_k...')
-        for i in range(10):
-            x0 = np.random.uniform(0,1)
-            i_spoof_k, Q, v, a, rho, mu_p = i_spoofing(i_mm, dq, dp_p, H, weights, depth, f,\
-                                ask_volumes, idxs, x0)
-            np.save(f'output/i_spoof_k_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof_k)
+        x0 = np.random.uniform(0,1)
+        i_spoof, v_spoof, Q, v, a, rho, mu_p = i_spoofing(i_mm, dq, dp_p, H, weights, depth, f,\
+                            ask_volumes, idxs, x0)
+        np.save(f'output/i_spoof_k_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof)
 
-            fig, ax = plt.subplots(depth,1, figsize=(10,7), tight_layout=True)
-            fig.suptitle(r'$2\rho_t w_k \mu^+ \frac{1-\hat{i}_-(t)}{\hat{i}_-(t)}i_{spoof}^2 - (Q_k \rho_t + \nu_k)$', fontsize=13)
+        fig, ax = plt.subplots(depth,1, figsize=(10,7), tight_layout=True)
+        fig.suptitle(r'$2\rho_t w_k \mu^+ \frac{1-\hat{i}_-(t)}{\hat{i}_-(t)}i_{spoof}^2 - (Q_k \rho_t + \nu_k)$', fontsize=13)
+        term = []
+        for k in range(depth):
+            for t in range(rho.shape[0]):
+                y = 2 * rho[t] * weights[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k])
+                term.append(y)
+            term = np.array(term)
+            mask = term > 0
+            y = np.zeros_like(term)
+            y[np.where(mask)[0]] = term[mask] # np.where(mask) returns the index where mask is True
+            y[y==0] = np.nan
+            ax[k].plot(term)
+            ax[k].scatter(np.arange(rho.shape[0]), y, c='r')
+            ax[k].set_title(f'Level {k}', fontsize=10)
             term = []
-            for k in range(depth):
-                for t in range(rho.shape[0]):
-                    y = 2 * rho[t] * weights[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof_k[t, k]**2 - (Q[k] * rho[t] + v[k])
-                    term.append(y)
-                term = np.array(term)
-                mask = term > 0
-                y = np.zeros_like(term)
-                y[np.where(mask)[0]] = term[mask] # np.where(mask) returns the index where mask is True
-                y[y==0] = np.log(-1)
-                ax[k].plot(term)
-                ax[k].scatter(np.arange(rho.shape[0]), y, c='r')
-                ax[k].set_title(f'Level {k}', fontsize=10)
-                term = []
 
-            # Plot i_spoof
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            for i in range(depth):
-                ax[i].plot(i_mm, 'k', alpha=0.5)
-                ax[i].plot(i_spoof_k[:,i], 'r')
-                ax[i].set_title(rf'$i_spoof_{i+1}$', fontsize=15)
-                ax[i].set_xlim(-10, 10000)
-                ax[i].set_xlabel('t')
-                i_spoof_zero = np.zeros(shape=i_spoof_k.shape[0])
-            plt.savefig(f'images/i_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
+        # Plot i_spoof, v_spoof
+        fig, ax = plt.subplots(depth, 2, figsize=(10,7), tight_layout=True)
+        for i in range(depth):
+            ax[i,0].plot(i_mm, 'k', alpha=0.8, label='i_{-}(t)')
+            ax[i,0].plot(i_spoof[:,i], 'r', label='i_{spoof}(t)', alpha=0.8)
+            ax[i,0].set_title(rf'$Level_{i+1}$', fontsize=13)
+            ax[i,0].set_xlim(-10, 10000)
+            ax[i,0].set_xlabel('t')
+            ax[i,1].plot(v_spoof[:,i], 'r', label='v_{spoof}(t)', alpha=0.8)
+            ax[i,1].set_title(rf'$Level_{i+1}$', fontsize=13)
+            ax[i,1].set_xlim(-10, 10000)
+            ax[i,1].set_xlabel('t')
+            ax[i,0].legend(loc='upper right')
+            ax[i,1].legend(loc='upper right')
+        plt.savefig(f'images/i_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
 
-            # Plot Q, v, rho, mu_p
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            ax[0].scatter(np.arange(Q.shape[0]), Q, c='k')
-            ax[0].set_title(r'$Q_k$', fontsize=15)
-            ax[0].set_xlabel('Level')
-            ax[1].scatter(np.arange(v.shape[0]), v, c='k')
-            ax[1].set_title(r'$v$', fontsize=15)
-            ax[1].set_xlabel('Level')
-            ax[2].plot(rho, 'k')
-            ax[2].set_title(r'$\rho$', fontsize=15)
-            ax[2].hlines(rho.mean(), 0, rho.shape[0], linestyles='dashed', color='red')
-            ax[2].set_xlabel('t')
-            ax[3].hlines(mu_p, 0, N, 'k')
-            ax[3].set_title(r'$\mu_p$', fontsize=15)
-            ax[3].set_xlabel('t')
-            plt.savefig(f'images/Qvrho_t_{info[0]}_{info[1]}_{f}_{N}.png')
-            
-            logging.info('Computing v_spoof...')
-            v_spoof = v_spoofing(i_spoof_k, i_mm, weights, Q, v, a, idxs, rho, mu_p)
-            np.save(f'output/v_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', v_spoof)
+        # Plot Q, v, rho, mu_p
+        fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
+        ax[0].scatter(np.arange(Q.shape[0]), Q, c='k')
+        ax[0].set_title(r'$Q_k$', fontsize=13)
+        ax[0].set_xlabel('Level')
+        ax[1].scatter(np.arange(v.shape[0]), v, c='k')
+        ax[1].set_title(r'$v$', fontsize=13)
+        ax[1].set_xlabel('Level')
+        ax[2].plot(rho, 'k')
+        ax[2].set_title(r'$\rho$', fontsize=13)
+        ax[2].hlines(rho[~np.isnan(rho)].mean(), 0, rho.shape[0], linestyles='dashed', color='red')
+        ax[2].set_xlabel('t')
+        ax[3].hlines(mu_p, 0, N, 'k')
+        ax[3].set_title(r'$\mu_p$', fontsize=13)
+        ax[3].set_xlabel('t')
+        plt.savefig(f'images/Qvrho_t_{info[0]}_{info[1]}_{f}_{N}.png')
 
-            # Plot v_spoof
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            mask = [v_spoof[:, i] > 0 for i in range(4)]
-            for i in range(4):
-                y = np.zeros_like(v_spoof[:,i])
-                y[np.where(mask[i])[0]] = np.log(-1)
-                ax[i].plot(v_spoof[:,i], 'g')
-                ax[i].scatter(np.arange(v_spoof[:,i].shape[0]), y, c='r')
-                ax[i].set_title(rf'$v_spoof_{i+1}$', fontsize=15)
-                ax[i].set_xlim(-10, 10000)
-                ax[i].set_xlabel('t')
-                v_spoof_zero = np.zeros(shape=v_spoof.shape[0])
-            plt.savefig(f'images/v_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
+        # logging.info('Computing i_spoofing...')
+        # i_spoof = i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs)
+        # np.save(f'output/i_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof)
 
-            # logging.info('Computing i_spoofing...')
-            # i_spoof = i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs)
-            # np.save(f'output/i_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof)
-
-            # Plot i_spoof(i_mm)
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            for i in range(depth):
-                ax[i].plot(np.linspace(0,1,1000), np.linspace(0,1,1000), 'k', linestyle='dashed', alpha=0.7)
-                ax[i].scatter(i_mm, i_spoof_k[:,i], c='g')
-                ax[i].set_title(r'$i_{spoof}(i_{-})$', fontsize=15)
-                ax[i].set_xlabel(r'$i_{-}$', fontsize=15)
-                ax[i].set_ylabel(r'$i_{spoof}$', fontsize=15)
-            plt.show()
-        # plt.savefig(f'images/i_spoof_imb_{info[0]}_{info[1]}_{f}_{N}.png')
+        # Plot i_spoof(i_mm)
+        fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
+        for i in range(depth):
+            ax[i].plot(np.linspace(0,1,1000), np.linspace(0,1,1000), 'k', linestyle='dashed', alpha=0.7)
+            ax[i].scatter(i_mm, i_spoof[:,i], c='g')
+            ax[i].set_title(r'$i_{spoof}(i_{-})$', fontsize=13)
+            ax[i].set_xlabel(r'$i_{-}$', fontsize=13)
+            ax[i].set_ylabel(r'$i_{spoof}$', fontsize=13)
+        plt.savefig(f'images/i_spoof_imb_{info[0]}_{info[1]}_{f}_{N}.png')
 
 # Figure 2 of the paper
 # i = np.random.uniform(0, 1, size=1000)
