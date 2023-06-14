@@ -578,8 +578,13 @@ def joint_imbalance(message, imbalance, N, f):
 
     return i_mm, i_pm, i_mp, i_pp
 
-def implicit_eq_i_spoof(x, i_mm, w_k, Q_k, rho_t, mu_p, v_k):
-    implicit_equation = 1 / x - 1 / i_mm - (1 - i_mm) * w_k / Q_k * max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * x**2 /
+def implicit_eq_i_spoof(x, i_mm, a, b, w_k, Q_k, rho_t, mu_p, v_k):
+    spoof_term = b / (a + b + x * w_k)
+    # print('spoof_term: ', spoof_term)
+    # print('i_mm: ', i_mm)
+    # print('w_k: ', w_k)
+    # print('x: ', x)
+    implicit_equation = x - 1 - 1 / i_mm - (1 - i_mm) * w_k / Q_k * max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * spoof_term**2 /
                                                                   - (Q_k * rho_t + v_k))
     return implicit_equation
 
@@ -617,7 +622,7 @@ def MO_volumes(message, N, f):
 
     return H, idxs
 
-def i_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, idxs, x0):
+def v_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, bid_volumes, idxs, x0):
     '''This function takes as input the imbalance just before a market order, the distribution of dq, the distribution
     of dp, the weight, the level k where the spoofing is performed, the depth, the bid and ask volumes and the message
     dataframe and returns the imbalance of spoofing.
@@ -654,13 +659,15 @@ def i_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, idxs, x0):
 
     rho = np.zeros(idxs.shape[0])
     a = np.zeros(idxs.shape[0])
+    b = np.zeros(idxs.shape[0])
     for t, tt in zip(idxs, np.arange(idxs.shape[0])):
         a[tt] = (ask_volumes[t:t-f:-1].sum(axis=0).sum() / (weight.shape[0]*f))
+        b[tt] = (bid_volumes[t:t-f:-1].sum(axis=0).sum() / (weight.shape[0]*f))
         rho[tt] = weight.shape[0] * H[t:t-f:-1].sum() / a[tt]
     
     mu_p = sum(value * probability for value, probability in zip(np.arange(-depth, depth+1), dp_p))
     
-    i_spoof = np.zeros(shape=[i_mm.shape[0], depth]) # One value of i_spoof for each time and each level k
+    v_spoof = np.zeros(shape=[i_mm.shape[0], depth]) # One value of i_spoof for each time and each level k
     Q = np.zeros(shape=depth)
     v = np.zeros(shape=depth)
     for k in tqdm(range(depth), desc='Levels'):
@@ -669,36 +676,35 @@ def i_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, idxs, x0):
         # t runs over all the times of the market orders
         c0 = 0
         for t in zip(range(i_mm.shape[0])):
-            solution = fsolve(implicit_eq_i_spoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
+            solution = fsolve(implicit_eq_i_spoof, x0=x0, args=(i_mm[t],a[t], b[t], weight[k], Q[k], rho[t], mu_p, v[k]))
             check = max(0, 2 * rho[t] * weight[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * solution**2 - (Q[k] * rho[t] + v[k]))
             if check == 0:
                 c0 += 1
             # if solution > i_mm[t]:
             #     i_spoof[t, k] = np.log(-1)
             # else:
-            i_spoof[t, k] = solution
+            v_spoof[t, k] = solution
         print(c0/i_mm.shape[0])
 
-    return i_spoof, Q, v, a, rho, mu_p
+    return v_spoof, Q, v, a, b, rho, mu_p
 
-def i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs):
+def i_spoofing_total(a, b, v_spoof, weights, depth):
     
-    level = int(input('How far do you want to spoof? (select the last level): '))
-    b = bid_volumes_fsummed[idxs].sum(axis=1)
-    a = ask_volumes_fsummed[idxs].sum(axis=1)
-    spoof_term = np.array([v_spoof[:, lev] * weights[lev] for lev in range(level)]).sum(axis=0)
-    i_spoof = b / (a + b + spoof_term)
+    i_spoof = np.zeros(shape=[a.shape[0], weights.shape[0]])
+    for lev in range(depth):
+        spoof_term = (v_spoof[:, lev] * weights[lev]).sum(axis=0)
+        i_spoof[:, lev] = b / (a + b + spoof_term)
     return i_spoof
 
-def v_spoofing(i_spoof, i_mm, w, Q, v, a, idxs, rho, mu_p):
-    v_spoof = np.zeros(shape=[i_spoof.shape[0], w.shape[0]])
-    for k in tqdm(range(w.shape[0]), desc='Levels'):
-        for t, ts in tqdm(zip(range(i_spoof.shape[0]), idxs)):
-            if i_spoof[t, k] == 0:
-                v_spoof[t, k] = 0
-            else:
-                v_spoof[t, k] = a[t] / Q[k] * max(0, (2 * rho[t] * w[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k])))
-    return v_spoof
+# def v_spoofing(i_spoof, i_mm, w, Q, v, a, idxs, rho, mu_p):
+#     v_spoof = np.zeros(shape=[i_spoof.shape[0], w.shape[0]])
+#     for k in tqdm(range(w.shape[0]), desc='Levels'):
+#         for t, ts in tqdm(zip(range(i_spoof.shape[0]), idxs)):
+#             if i_spoof[t, k] == 0:
+#                 v_spoof[t, k] = 0
+#             else:
+#                 v_spoof[t, k] = a[t] / Q[k] * max(0, (2 * rho[t] * w[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k])))
+#     return v_spoof
 
 def dp_dist(parameters, M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, num_events, f, depth):
     '''This function takes as input the parameters, the number of levels, the number of events, the bid and ask volumes,
@@ -1106,79 +1112,89 @@ if __name__ == '__main__':
 
         dp_p = np.load(f'output/dp_p_{info[0]}_{info[1]}_{f}_{N}.npy') # Load the distribution of dp_p evaluated via the optimization
 
-        logging.info('Computing i_spoof_k...')
+        logging.info('Computing v_spoof_k...')
         for i in range(10):
             x0 = np.random.uniform(0,1)
-            i_spoof_k, Q, v, a, rho, mu_p = i_spoofing(i_mm, dq, dp_p, H, weights, depth, f,\
-                                ask_volumes, idxs, x0)
-            np.save(f'output/i_spoof_k_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof_k)
+            v_spoof_k, Q, v, a, b, rho, mu_p = v_spoofing(i_mm, dq, dp_p, H, weights, depth, f,\
+                                ask_volumes_fsummed, bid_volumes_fsummed, idxs, x0)
+            np.save(f'output/v_spoof_k_{info[0]}_{info[1]}_{f}_{N}.npy', v_spoof_k)
 
-            fig, ax = plt.subplots(depth,1, figsize=(10,7), tight_layout=True)
-            fig.suptitle(r'$2\rho_t w_k \mu^+ \frac{1-\hat{i}_-(t)}{\hat{i}_-(t)}i_{spoof}^2 - (Q_k \rho_t + \nu_k)$', fontsize=13)
-            term = []
-            for k in range(depth):
-                for t in range(rho.shape[0]):
-                    y = 2 * rho[t] * weights[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof_k[t, k]**2 - (Q[k] * rho[t] + v[k])
-                    term.append(y)
-                term = np.array(term)
-                mask = term > 0
-                y = np.zeros_like(term)
-                y[np.where(mask)[0]] = term[mask] # np.where(mask) returns the index where mask is True
-                y[y==0] = np.log(-1)
-                ax[k].plot(term)
-                ax[k].scatter(np.arange(rho.shape[0]), y, c='r')
-                ax[k].set_title(f'Level {k}', fontsize=10)
-                term = []
+            # Plot the max term
+            # fig, ax = plt.subplots(depth,1, figsize=(10,7), tight_layout=True)
+            # fig.suptitle(r'$2\rho_t w_k \mu^+ \frac{1-\hat{i}_-(t)}{\hat{i}_-(t)}i_{spoof}^2 - (Q_k \rho_t + \nu_k)$', fontsize=13)
+            # term = []
+            # for k in range(depth):
+            #     for t in range(rho.shape[0]):
+            #         y = 2 * rho[t] * weights[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * v_spoof_k[t, k]**2 - (Q[k] * rho[t] + v[k])
+            #         term.append(y)
+            #     term = np.array(term)
+            #     mask = term > 0
+            #     y = np.zeros_like(term)
+            #     y[np.where(mask)[0]] = term[mask] # np.where(mask) returns the index where mask is True
+            #     y[y==0] = np.log(-1)
+            #     ax[k].plot(term)
+            #     ax[k].scatter(np.arange(rho.shape[0]), y, c='r')
+            #     ax[k].set_title(f'Level {k}', fontsize=10)
+            #     term = []
 
-            # Plot i_spoof
+            # Plot v_spoof
             fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
             for i in range(depth):
-                ax[i].plot(i_mm, 'k', alpha=0.5)
+                # ax[i].plot(i_mm, 'k', alpha=0.5)
+                ax[i].plot(v_spoof_k[:,i], 'r')
+                ax[i].set_title(rf'$v_spoof_{i+1}$', fontsize=15)
+                ax[i].set_xlim(-10, 10000)
+                ax[i].set_xlabel('t')
+            plt.savefig(f'images/v_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
+
+            # Plot Q, v, rho, mu_p
+            # fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
+            # ax[0].scatter(np.arange(Q.shape[0]), Q, c='k')
+            # ax[0].set_title(r'$Q_k$', fontsize=15)
+            # ax[0].set_xlabel('Level')
+            # ax[1].scatter(np.arange(v.shape[0]), v, c='k')
+            # ax[1].set_title(r'$v$', fontsize=15)
+            # ax[1].set_xlabel('Level')
+            # ax[2].plot(rho, 'k')
+            # ax[2].set_title(r'$\rho$', fontsize=15)
+            # ax[2].hlines(rho.mean(), 0, rho.shape[0], linestyles='dashed', color='red')
+            # ax[2].set_xlabel('t')
+            # ax[3].hlines(mu_p, 0, N, 'k')
+            # ax[3].set_title(r'$\mu_p$', fontsize=15)
+            # ax[3].set_xlabel('t')
+            # plt.savefig(f'images/Qvrho_t_{info[0]}_{info[1]}_{f}_{N}.png')
+            
+            # logging.info('Computing v_spoof...')
+            # v_spoof = v_spoofing(i_spoof_k, i_mm, weights, Q, v, a, idxs, rho, mu_p)
+            # np.save(f'output/v_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', v_spoof)
+
+            # # Plot v_spoof
+            # fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
+            # mask = [v_spoof[:, i] > 0 for i in range(4)]
+            # for i in range(4):
+            #     y = np.zeros_like(v_spoof[:,i])
+            #     y[np.where(mask[i])[0]] = np.log(-1)
+            #     ax[i].plot(v_spoof[:,i], 'g')
+            #     ax[i].scatter(np.arange(v_spoof[:,i].shape[0]), y, c='r')
+            #     ax[i].set_title(rf'$v_spoof_{i+1}$', fontsize=15)
+            #     ax[i].set_xlim(-10, 10000)
+            #     ax[i].set_xlabel('t')
+            #     v_spoof_zero = np.zeros(shape=v_spoof.shape[0])
+            # plt.savefig(f'images/v_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
+
+            logging.info('Computing i_spoofing...')
+            i_spoof_k = i_spoofing_total(a, b, v_spoof_k, weights, depth)
+            np.save(f'output/i_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof_k)
+
+            # Plot i_spoof_k
+            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
+            for i in range(depth):
+                # ax[i].plot(i_mm, 'k', alpha=0.5)
                 ax[i].plot(i_spoof_k[:,i], 'r')
                 ax[i].set_title(rf'$i_spoof_{i+1}$', fontsize=15)
                 ax[i].set_xlim(-10, 10000)
                 ax[i].set_xlabel('t')
-                i_spoof_zero = np.zeros(shape=i_spoof_k.shape[0])
-            plt.savefig(f'images/i_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
-
-            # Plot Q, v, rho, mu_p
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            ax[0].scatter(np.arange(Q.shape[0]), Q, c='k')
-            ax[0].set_title(r'$Q_k$', fontsize=15)
-            ax[0].set_xlabel('Level')
-            ax[1].scatter(np.arange(v.shape[0]), v, c='k')
-            ax[1].set_title(r'$v$', fontsize=15)
-            ax[1].set_xlabel('Level')
-            ax[2].plot(rho, 'k')
-            ax[2].set_title(r'$\rho$', fontsize=15)
-            ax[2].hlines(rho.mean(), 0, rho.shape[0], linestyles='dashed', color='red')
-            ax[2].set_xlabel('t')
-            ax[3].hlines(mu_p, 0, N, 'k')
-            ax[3].set_title(r'$\mu_p$', fontsize=15)
-            ax[3].set_xlabel('t')
-            plt.savefig(f'images/Qvrho_t_{info[0]}_{info[1]}_{f}_{N}.png')
-            
-            logging.info('Computing v_spoof...')
-            v_spoof = v_spoofing(i_spoof_k, i_mm, weights, Q, v, a, idxs, rho, mu_p)
-            np.save(f'output/v_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', v_spoof)
-
-            # Plot v_spoof
-            fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
-            mask = [v_spoof[:, i] > 0 for i in range(4)]
-            for i in range(4):
-                y = np.zeros_like(v_spoof[:,i])
-                y[np.where(mask[i])[0]] = np.log(-1)
-                ax[i].plot(v_spoof[:,i], 'g')
-                ax[i].scatter(np.arange(v_spoof[:,i].shape[0]), y, c='r')
-                ax[i].set_title(rf'$v_spoof_{i+1}$', fontsize=15)
-                ax[i].set_xlim(-10, 10000)
-                ax[i].set_xlabel('t')
-                v_spoof_zero = np.zeros(shape=v_spoof.shape[0])
-            plt.savefig(f'images/v_spoof_{info[0]}_{info[1]}_{f}_{N}.png')
-
-            # logging.info('Computing i_spoofing...')
-            # i_spoof = i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs)
-            # np.save(f'output/i_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof)
+            plt.savefig(f'images/i_spoof_k_{info[0]}_{info[1]}_{f}_{N}.png')
 
             # Plot i_spoof(i_mm)
             fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
