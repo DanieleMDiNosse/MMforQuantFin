@@ -1,30 +1,10 @@
 '''
-Message file's columns are as follows:
-Time, Event type, Order ID, Size, Price, Direction
-where Eventy type is:
-1: Submission of a new limit order
-2: Cancellation (partial deletion) of a limit order
-3: Deletion (total) of a limit order
-4: Execution of a visible limit order
-5: Execution of a hidden limit order
-6: Cross
-7: Trading halt indicator
-Instead, Direction is:
--1: Sell limit order -> a sell order has initiated a trade, i.e. an agent has bought
-                        causing the price to increase
-1: Buy limit order -> a buy order has initiated a trade, i.e. an agent has sold 
-                        causing the price to decrease
-
-Orderbook file's columns are as follows:
-Ask price 1, Ask size 1, Bid price 1, Bid size 1, Ask price 2, Ask size 2, Bid price 2, Bid size 2, ...
-
-For TSLA the tick size in 2013 was 0.01 USD (100 in the data)
-
 IMPORTANTE NOTE
 ---------------
 ALL YOU HAVE DONE IS INTENDED FOR AN AGENT THAT WANTS TO BUY A CERTAIN AMOUNT OF SHARES. SHE
 TRIES TO SPOOF THE MARKET BY PLACING LIMIT ORDERS AT SOME PRICE LEVEL AT THE ASK SIDE, IN ORDER
-TO CREATE A DOWNSIDE PRESSURE AND TAKE ADVANTAGE OF THE DECREASING PRICE.
+TO CREATE A DOWNSIDE PRESSURE AND TAKE ADVANTAGE OF THE DECREASING PRICE. ALL THE ANALYSIS IS 
+DONE CONSIDERING THE BEST ASK PRICE AS "TRUE" PRICE.
 '''
 
 import numpy as np
@@ -42,7 +22,7 @@ import warnings
 from datetime import datetime, timedelta
 from scipy import stats
 import statsmodels.api as sm
-from scipy.optimize import root, fsolve, leastsq
+from scipy.optimize import leastsq
 
 def data_preproc(paths_lob, paths_msg, N_days):
     '''This function takes as input the paths of the orderbook and message files for a period of N_days and returns
@@ -393,7 +373,7 @@ def compute_support(orderbook, message, f, tick, N):
     quantile05 = np.quantile(ret[1:], 0.005)
     quantile95 = np.quantile(ret[1:], 0.995)
     depth = int((quantile95 - quantile05) / 2)
-    return depth
+    return depth, ret
 
 @nb.njit
 def dot_product(a, b):
@@ -578,11 +558,6 @@ def joint_imbalance(message, imbalance, N, f):
 
     return i_mm, i_pm, i_mp, i_pp
 
-def implicit_eq_i_spoof(x, i_mm, w_k, Q_k, rho_t, mu_p, v_k):
-    implicit_equation = 1 / x - 1 / i_mm - (1 - i_mm) / i_mm * w_k / Q_k * max(0, 2 * rho_t * w_k * mu_p * (1 - i_mm) / i_mm * x**2 /
-                                                                  - (Q_k * rho_t + v_k))
-    return implicit_equation
-
 def square_dist_ispoof(i, i_mm, w_k, Q_k, rho_t, mu_p, v_k):
     lhs = 1 / i
     rhs = np.array([1 / i_mm + (1 - i_mm) / i_mm * w_k / Q_k * \
@@ -677,12 +652,7 @@ def i_spoofing(i_mm, dq, dp_p, H, weight, depth, f, ask_volumes, idxs, x0):
         for t in tqdm(range(i_mm.shape[0])):
             solution = leastsq(square_dist_ispoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
             i_spoof[t, k] = solution[0]
-            # solution = root(implicit_eq_i_spoof, x0=x0, args=(i_mm[t], weight[k], Q[k], rho[t], mu_p, v[k]))
             v_spoof[t, k] = a[t] / Q[k] * max(0, 2 * rho[t] * weight[k] * mu_p * (1 - i_mm[t]) / i_mm[t] * i_spoof[t, k]**2 - (Q[k] * rho[t] + v[k]))
-            # # if solution > i_mm[t]:
-            # #     i_spoof[t, k] = np.log(-1)
-            # # else:
-            # i_spoof[t, k] = solution.x
 
     return i_spoof, v_spoof, Q, v, a, rho, mu_p
 
@@ -694,6 +664,19 @@ def i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights,
     spoof_term = np.array([v_spoof[:, lev] * weights[lev] for lev in range(level)]).sum(axis=0)
     i_spoof = b / (a + b + spoof_term)
     return i_spoof
+
+def partition_into_quantiles(v, N):
+    sorted_v = np.sort(v)
+    inc = (len(v) - 1) / N
+    breakpoints = [round(i * inc) for i in range(1, N)]
+    
+    quantiles = []
+    quantiles.append(sorted_v[:breakpoints[0]+1])
+    for i in tqdm(range(1, N-1)):
+        quantiles.append(sorted_v[breakpoints[i-1]+1:breakpoints[i]+1])
+    quantiles.append(sorted_v[breakpoints[N-2]+1:])
+    
+    return np.array(quantiles, dtype=object)
 
 def dp_dist(parameters, M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, num_events, f, depth):
     '''This function takes as input the parameters, the number of levels, the number of events, the bid and ask volumes,
@@ -792,6 +775,20 @@ def insert_zeros_between_values(v, k):
             new_array.append(np.log(-1))
     return np.array(new_array[:-k])
 
+def create_bar_plot(array1, array2, x_labels, labels):
+    x = np.arange(len(x_labels))  # Generate x-axis values
+
+    width = 0.35  # Width of each bar
+
+    fig, ax = plt.subplots()
+    bars1 = ax.bar(x - width/2, array1, width, label=labels[0])
+    bars2 = ax.bar(x + width/2, array2, width, label=labels[1])
+
+    ax.set_xlabel('Depth')
+    ax.set_ylabel('Probability')
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels)
+    ax.legend()
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -887,7 +884,7 @@ if __name__ == '__main__':
     plt.savefig(f'images/freq_{info[0]}_{info[1]}.png')
     
     logging.info('Computing the support for the distributions dp and dq...\n')
-    depth = compute_support(orderbook, message, f, tick, N)
+    depth, ret = compute_support(orderbook, message, f, tick, N)
 
     # This vectors start from the very first element of the orderbook
     bid_prices, bid_volumes, ask_prices, ask_volumes = prices_and_volumes(orderbook, N)
@@ -936,76 +933,134 @@ if __name__ == '__main__':
         plt.savefig(f'images/dq_{info[0]}_{period[0]}_{period[1]}.png')
     
     if args.dp_dist:
-        os.system('rm opt.txt')
-        M = int(depth)*2 + 1
-        initial_params = np.random.uniform(0, 1, M+depth)
-        obj_fun = []
+        bifurcation = int(input('Recompute (1) or load (2) the dp+ distibrution?:\n'))
+        if bifurcation == 1:
+            os.system('rm opt.txt')
+            M = int(depth)*2 + 1
+            initial_params = np.random.uniform(0, 1, M+depth)
+            obj_fun = []
 
-        optimizer = int(input('Choose optimizer (1: trust-constr, 2: SLSQP)\n'))
-        if optimizer == 1:
-            optimizer = 'trust-constr'
-            A1 = np.append(np.ones(M), np.zeros(4))
-            A2 = np.append(np.zeros(M), np.ones(4))
-            b = np.array([1])
-            constraint1 = LinearConstraint(A1, b, b)
-            constraint2 = LinearConstraint(A2, b, b)
-            constraints = [constraint1, constraint2]
-            bounds = [(0,1) for i in range(M+4)]
-        elif optimizer == 2:
+            # optimizer = int(input('Choose optimizer (1: trust-constr, 2: SLSQP)\n'))
+            # if optimizer == 1:
+            #     optimizer = 'trust-constr'
+            #     A1 = np.append(np.ones(M), np.zeros(4))
+            #     A2 = np.append(np.zeros(M), np.ones(4))
+            #     b = np.array([1])
+            #     constraint1 = LinearConstraint(A1, b, b)
+            #     constraint2 = LinearConstraint(A2, b, b)
+            #     constraints = [constraint1, constraint2]
+            #     bounds = [(0,1) for i in range(M+4)]
+            # elif optimizer == 2:
             optimizer = 'SLSQP'
             constraint1 = {'type': 'eq', 'fun': constraint_fun1}
             constraint2 = {'type': 'eq', 'fun': constraint_fun2}
             constraints = [constraint1, constraint2]
             bounds = [(0,1) for i in range(M+depth)]
-                                            
+                                                
+            fig, ax = plt.subplots(2, 1, figsize=(8,5), tight_layout=True)
+            imb = avg_imbalance_faster(N, bid_volumes_fsummed, ask_volumes_fsummed, np.array([0.6,0.5,0.2,0.1]), f)
+            print('imbalanace shape ', N, f, imb.shape)
+            imb = np.append(np.zeros(f), imb)
+            ax[0].plot(imb, 'k')
+            ax[0].vlines(np.arange(0, imb.shape[0])[f:][::f], 0, 1, linestyles='dashed', color='red')
+            ax[0].set_title('Imbalance (with arbitrary weights)')
+            ax[1].plot(tick_ask_price[:N], 'k')
+            ax[1].vlines(np.arange(f, tick_ask_price[:N].shape[0])[::f], tick_ask_price[:N].min(), tick_ask_price[:N].max(), linestyles='dashed', color='red')
+            ax[1].set_title('Ask price')
+            ax1 = ax[1].twinx()
+            ask_prices_fdiff_extended = insert_zeros_between_values(ask_prices_fdiff, f-1)
+            ax1.scatter(np.arange(f, ask_prices_fdiff_extended.shape[0]), ask_prices_fdiff_extended[:-f], color='red', s=13)
+            ax[0].set_xlim(-10, 500)
+            ax[1].set_xlim(-10, 500)
+            plt.show()
 
-        fig, ax = plt.subplots(2, 1, figsize=(8,5), tight_layout=True)
-        imb = avg_imbalance_faster(N, bid_volumes_fsummed, ask_volumes_fsummed, np.array([0.6,0.5,0.2,0.1]), f)
-        print('imbalanace shape ', N, f, imb.shape)
-        imb = np.append(np.zeros(f), imb)
-        ax[0].plot(imb, 'k')
-        ax[0].vlines(np.arange(0, imb.shape[0])[f:][::f], 0, 1, linestyles='dashed', color='red')
-        ax[0].set_title('Imbalance (with arbitrary weights)')
-        ax[1].plot(tick_ask_price[:N], 'k')
-        ax[1].vlines(np.arange(f, tick_ask_price[:N].shape[0])[::f], tick_ask_price[:N].min(), tick_ask_price[:N].max(), linestyles='dashed', color='red')
-        ax[1].set_title('Ask price')
-        ax1 = ax[1].twinx()
-        ask_prices_fdiff_extended = insert_zeros_between_values(ask_prices_fdiff, f-1)
-        ax1.scatter(np.arange(f, ask_prices_fdiff_extended.shape[0]), ask_prices_fdiff_extended[:-f], color='red', s=13)
-        ax[0].set_xlim(-10, 500)
-        ax[1].set_xlim(-10, 500)
-        plt.show()
+            value, count = np.unique(ask_prices_fdiff, return_counts=True)
+            x = np.arange(value.min(), value.max()+1)
+            mask = np.in1d(x, value)
+            y = np.zeros_like(x)
+            y[mask] = count
+            y = y / count.sum()
+            plt.figure(tight_layout=True, figsize=(8,5))
+            plt.bar(x, y, color='green', edgecolor='black')
+            plt.title(f'Price change sampled every {f} events')
+            callback_func = create_callback(M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, N, f)
 
-        value, count = np.unique(ask_prices_fdiff, return_counts=True)
-        x = np.arange(value.min(), value.max()+1)
-        mask = np.in1d(x, value)
-        y = np.zeros_like(x)
-        y[mask] = count
-        y = y / count.sum()
-        plt.figure(tight_layout=True, figsize=(8,5))
-        plt.bar(x, y, color='green', edgecolor='black')
-        plt.title(f'Price change sampled every {f} events')
-        callback_func = create_callback(M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, N, f)
+            res = minimize(dp_dist, initial_params, args=(M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, N, f, depth),  \
+                        constraints=constraints, method=optimizer, bounds=bounds, \
+                        callback=callback_func)
 
-        res = minimize(dp_dist, initial_params, args=(M, ask_prices_fdiff, bid_volumes_fsummed, ask_volumes_fsummed, N, f, depth),  \
-                    constraints=constraints, method=optimizer, bounds=bounds, \
-                    callback=callback_func)
+            with open(f'opt.txt', 'a', encoding='utf-8') as file:
+                file.write(f"\nFINAL RESULT: {res}")
+            print(res.x)
+            print("Initial parameters:\n", np.exp(initial_params))
+            np.save(f'output/dp_p_{info[0]}_{info[1]}_{f}_{N}.npy', res.x[:M])
+            np.save(f'output/ws_{info[0]}_{info[1]}_{f}_{N}.npy', res.x[M:])
+            imb = avg_imbalance_faster(N, bid_volumes_fsummed, ask_volumes_fsummed, res.x[M:], f)
+            np.save(f'output/imb_{info[0]}_{info[1]}_{f}_{N}.npy', imb)
+            plt.figure(tight_layout=True, figsize=(5,5))
+            plt.plot(obj_fun)
+            plt.title('Objective function')
+            plt.figure(tight_layout=True, figsize=(5,5))
+            plt.bar(list(range(-int((M-1)/2),int((M-1)/2) + 1)), res.x[:M], color='green', edgecolor='black')
+            plt.title(r'$dp^+$')
+            plt.savefig(f'images/dp_p_{info[0]}_{info[1]}_{f}_{N}_{optimizer}.png')
+            plt.show()
 
-        with open(f'opt.txt', 'a', encoding='utf-8') as file:
-            file.write(f"\nFINAL RESULT: {res}")
-        print(res.x)
-        print("Initial parameters:\n", np.exp(initial_params))
-        np.save(f'output/dp_p_{info[0]}_{info[1]}_{f}_{N}.npy', res.x[:M])
-        np.save(f'output/ws_{info[0]}_{info[1]}_{f}_{N}.npy', res.x[M:])
-        plt.figure(tight_layout=True, figsize=(5,5))
-        plt.plot(obj_fun)
-        plt.title('Objective function')
-        plt.figure(tight_layout=True, figsize=(5,5))
-        plt.bar(list(range(-int((M-1)/2),int((M-1)/2) + 1)), res.x[:M], color='green', edgecolor='black')
-        plt.title(r'$dp^+$')
-        plt.savefig(f'images/dp_p_{info[0]}_{info[1]}_{f}_{N}_{optimizer}.png')
-        plt.show()
-    
+        if bifurcation == 2:
+            chi_square = int(input('Do you want to compute the chi-square test? (1: yes, 2: no)\n'))
+            if chi_square == 1:
+                logging.info('Computing the chi-square test...')
+                imb = np.load(f'output/imb_{info[0]}_{info[1]}_{f}_{N}.npy')
+                imb = imb[::f]
+                quantiles = partition_into_quantiles(imb, 20) # Bucket the imbalance into 20 quantiles
+                print(quantiles.shape)
+                # Take the indexes of the imbalance that are in each quantile and consider the price change at the f-th event after that value of the imbalance
+                # (so I have the pair (x_m, i_m) where x_m represents the price change "influenced" by i_m (so I see i_m at time t and check the price change at time t+f)
+                # and compute the probability of that price change given the imbalance.
+                imb_indxs = np.array([np.array([np.where(imb == i)[0][0] for i in quantiles[j]], dtype=object) for j in tqdm(range(quantiles.shape[0]), desc='idxs imb for each quantile')], dtype=object) # Take the indexes of the imbalance that are in each quantile
+                imb_indxs = np.array([np.sort(imb_indxs[i]) for i in range(quantiles.shape[0])], dtype=object)
+                p_changes_quantile = np.array([np.array([ask_prices_fdiff[i] for i in imb_indxs[j][:-1]]) for j in tqdm(range(quantiles.shape[0]), desc='p change for each quantile')]) # Take the price change at the f-th event after that value of the imbalance
+                
+                # Compute the empirical probability distribution of the price change given the imbalance for each quantile
+                dp_imb_quantile = np.zeros(shape=(quantiles.shape[0], depth*2+1))
+                for i in tqdm(range(quantiles.shape[0]), desc='dp emp for each quantile'):
+                    changes = p_changes_quantile[i][p_changes_quantile[i] <= depth]
+                    changes = changes[changes >= -depth]
+                    value, count = np.unique(changes, return_counts=True)
+                    x = np.arange(-depth, depth+1)
+                    mask = np.isin(x, value)
+                    y = np.zeros_like(x)
+                    y[mask] = count
+                    dp_imb_quantile[i, :] = y / count.sum()
+                np.save(f'output/dp_quantemp_{info[0]}_{info[1]}_{f}_{N}.npy', dp_imb_quantile)
+                
+                # Compute the theoretical probability distribution of the price change given the imbalance for each quantile
+                # The imbalance is taken as the mid value of each quantile
+                mid_quantiles = np.array([np.mean(quantiles[i]) for i in range(quantiles.shape[0])])  # Take the mid value of each quantile
+                dp_p = np.load(f'output/dp_p_{info[0]}_{info[1]}_{f}_{N}.npy') # Load the distribution of dp
+                dp_imb_theory = np.zeros(shape=(quantiles.shape[0], depth*2+1))
+                for i in tqdm(range(quantiles.shape[0]), desc='dp theory for each quantile'):
+                    dp_imb_theory[i, :] = mid_quantiles[i] * dp_p + (1 - mid_quantiles[i]) * dp_p[::-1]
+                np.save(f'output/dp_quanttheory_{info[0]}_{info[1]}_{f}_{N}.npy', dp_imb_theory)
+                # fig, ax = plt.subplots(5, 4, figsize=(8,5), tight_layout=True)
+                create_bar_plot(dp_imb_quantile[0], dp_imb_theory[0], np.arange(-depth, depth+1), ['Empirical', 'Theoretical'])
+                # Perform a chi-square test to check if the empirical distribution is compatible with the theoretical one
+                p_values = np.zeros(quantiles.shape[0])
+                for i in tqdm(range(quantiles.shape[0]), desc='chi-square for each quantile'):
+                    p_values[i] = stats.chisquare(dp_imb_quantile[i], dp_imb_theory[i])[1]
+                    print(f'p-value for quantile {i}: {p_values[i]}')
+                np.save(f'output/p_values_{info[0]}_{info[1]}_{f}_{N}.npy', chi_square)
+
+                plt.figure(tight_layout=True, figsize=(8,5))
+                plt.bar(np.arange(quantiles.shape[0]), p_values, color='green', edgecolor='black')
+                plt.title('Chi-square test')
+                plt.xlabel('Quantile')
+                plt.ylabel('p-value')
+                plt.savefig(f'images/chi_square_{info[0]}_{info[1]}_{f}_{N}.png')
+            else:
+                exit()
+
+
     if args.imbalance_plot:
         weight = np.array([0.6,0.5,0.2,0.1])
         # weight = np.array([0.1,0.2,0.5,0.6])
@@ -1157,10 +1212,6 @@ if __name__ == '__main__':
         ax[3].set_xlabel('t')
         plt.savefig(f'images/Qvrho_t_{info[0]}_{info[1]}_{f}_{N}.png')
 
-        # logging.info('Computing i_spoofing...')
-        # i_spoof = i_spoofing_total(ask_volumes_fsummed, bid_volumes_fsummed, v_spoof, weights, idxs)
-        # np.save(f'output/i_spoof_{info[0]}_{info[1]}_{f}_{N}.npy', i_spoof)
-
         # Plot i_spoof(i_mm)
         fig, ax = plt.subplots(depth, 1, figsize=(10,7), tight_layout=True)
         for i in range(depth):
@@ -1170,34 +1221,6 @@ if __name__ == '__main__':
             ax[i].set_xlabel(r'$i_{-}$', fontsize=13)
             ax[i].set_ylabel(r'$i_{spoof}$', fontsize=13)
         plt.savefig(f'images/i_spoof_imb_{info[0]}_{info[1]}_{f}_{N}.png')
-
-# Figure 2 of the paper
-# i = np.random.uniform(0, 1, size=1000)
-# dq = np.array([0.006 for i in range(2*depth+1)])
-# Q_k = [dq[depth + k +1:].sum() for k in range(depth)]
-# v_k = [np.array([(i-k) * dq[depth + k + 1:] for i in range(depth + k + 1, 2*depth+1)]).sum() for k in range(depth)]
-# w_k = [0.5,0.5,0.5,0.5]
-# rho_t = 3
-# mu_p = 3
-
-# for Q, v, w in zip(Q_k, v_k, w_k):
-#     solution = []
-#     for ii in i_mm:
-#         x_initial = 0.5  # Example initial value, you can change it accordingly
-#         result = root(implicit_eq_i_spoof, x_initial, args=(ii, w, Q, rho_t, mu_p, v))
-#         if result.success:
-#             solution.append(result.x)
-#         else:
-#             solution.append(np.nan)
-
-#     plt.plot(i_mm, solution, label=f"Q_k={Q}, v_k={v}")
-
-#     plt.xlabel('i')
-#     plt.ylabel('Solution')
-#     plt.title('Roots of the Implicit Equation')
-#     plt.legend()
-#     plt.grid(True)
-# plt.show()
 
     plt.show()
     print('Last episode of One Piece was amazing!')
